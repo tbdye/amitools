@@ -585,6 +585,42 @@ def fs_comment_dircache_write_fails_test(
     assert validate(image) == []
 
 
+@pytest.mark.parametrize(
+    "dos_type,fail",
+    [(dos_type, "header") for dos_type in DOS_TYPES]
+    + [(dos_type, "dircache") for dos_type in DIRCACHE_DOS_TYPES],
+    ids=lambda v: dos_id(v) if isinstance(v, int) else v,
+)
+def fs_mod_ts_write_fails_test(tmp_path, dos_type, fail, monkeypatch):
+    # The same for a change of the time stamp: it stays as it was, also
+    # when the next change writes the header and the record.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    volume.create_dir(FSString("dir"))
+    volume.write_file(b"data", FSString("dir/f"))
+    node = volume.get_path_name(FSString("dir/f"))
+    old = str(node.get_meta_info().get_mod_ts())
+
+    cls = DirCacheBlock if fail == "dircache" else FileHeaderBlock
+    with monkeypatch.context() as patch:
+        patch.setattr(cls, "write", fail_write)
+        with pytest.raises(IOError):
+            node.change_mod_ts_by_string("01.01.2001 10:00:00")
+    assert str(node.block.mod_ts) == old
+    assert str(node.get_meta_info().get_mod_ts()) == old
+    node.change_protect(0x0F)
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    node = volume.get_path_name(FSString("dir/f"))
+    assert str(node.get_meta_info().get_mod_ts()) == old
+    if volume.is_dircache:
+        (record,) = dircache_records(volume, "dir")
+        assert str(record.mod_ts) == old
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
 @pytest.mark.parametrize("nth", [1, 2], ids=["to_block", "from_block"])
 @pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
 def fs_comment_dircache_move_write_fails_test(tmp_path, dos_type, nth, monkeypatch):
