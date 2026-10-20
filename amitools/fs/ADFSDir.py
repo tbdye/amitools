@@ -4,7 +4,7 @@ from .block.UserDirBlock import UserDirBlock
 from .block.EntryBlock import EntryBlock
 from .block.DirCacheBlock import *
 from .ADFSFile import ADFSFile
-from .ADFSNode import ADFSNode
+from .ADFSNode import ADFSNode, check_comment
 from .FileName import FileName
 from .FSError import *
 from .FSString import FSString
@@ -190,7 +190,7 @@ class ADFSDir(ADFSNode):
         # check comment
         extra_comment = meta_info.get_comment()
         if extra_comment is not None:
-            self._check_comment(extra_comment, file_name=name)
+            check_comment(extra_comment, node=self, file_name=name)
         # a long name comment that does not fit beside the name in the header
         # goes into a comment block, added once the node's blocks are written
         if (

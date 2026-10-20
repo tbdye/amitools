@@ -5,6 +5,7 @@ import unicodedata
 
 from .ADFSDir import ADFSDir
 from .ADFSFile import ADFSFile
+from .ADFSNode import check_comment
 from .ADFSVolume import ADFSVolume
 from .MetaDB import MetaDB
 from . import DosType
@@ -137,6 +138,22 @@ class Imager:
         if os.path.exists(meta_path):
             self.meta_db = MetaDB()
             self.meta_db.load(meta_path)
+        self.pack_check_comments(in_path)
+
+    def pack_check_comments(self, in_path):
+        """refuse a comment the image cannot hold before anything is written"""
+        metas = []
+        if self.meta_db != None:
+            metas += self.meta_db.metas.items()
+        for dir_path, dir_names, file_names in os.walk(in_path):
+            for name in dir_names + file_names:
+                meta_path = os.path.join(dir_path, name) + self.meta_fsuae.get_suffix()
+                if os.path.isfile(meta_path):
+                    metas.append((meta_path, self.meta_fsuae.load_meta(meta_path)))
+        for path, meta_info in metas:
+            comment = meta_info.get_comment()
+            if comment is not None:
+                check_comment(comment, file_name=FSString(path))
 
     def pack_end(self, in_path, volume):
         boot_code_path = in_path + ".bootcode"

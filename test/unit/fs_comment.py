@@ -14,6 +14,7 @@ from amitools.fs.block.UserDirBlock import UserDirBlock
 from amitools.fs.validate.Log import Log
 from amitools.fs.validate.Validator import Validator
 import amitools.fs.DosType as DosType
+from amitools.tools.xdftool import main as xdftool_main
 
 DOS_TYPES = [DosType.DOS0 + n for n in range(8)]
 DIRCACHE_DOS_TYPES = [DosType.DOS4, DosType.DOS5]
@@ -903,6 +904,28 @@ def fs_comment_too_long_test(tmp_path, dos_type, length):
     assert volume.get_path_name(FSString("new")) is None
     close_volume(blkdev, volume)
     assert validate(image) == []
+
+
+@pytest.mark.parametrize("meta", ["xdfmeta", "uaem"])
+def fs_comment_too_long_pack_test(tmp_path, meta, capsys):
+    # A comment the image cannot hold, in the metadata of a tree to pack,
+    # stops xdftool pack before it creates the image.
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "a.txt").write_bytes(b"data")
+    comment = "x" * 80
+    if meta == "xdfmeta":
+        ts = "01.01.2020 00:00:00.00"
+        lines = "Test:DOS0,%s,%s,%s\na.txt:rwed,%s,%s\n" % (ts, ts, ts, ts, comment)
+        (tmp_path / "tree.xdfmeta").write_bytes(lines.encode())
+    else:
+        line = "----rwed 2020-01-01 00:00:00.00 %s\n" % comment
+        (tree / "a.txt.uaem").write_bytes(line.encode())
+    image = tmp_path / "test.adf"
+    capsys.readouterr()
+    assert xdftool_main([str(image), "pack", str(tree)]) == 3
+    assert "Invalid comment" in capsys.readouterr().out
+    assert not image.exists()
 
 
 @pytest.mark.parametrize("dos_type", DOS_TYPES, ids=dos_id)
