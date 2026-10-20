@@ -1,15 +1,23 @@
+import struct
+
 import pytest
 
 from amitools.fs.ADFSVolume import ADFSVolume
 from amitools.fs.FSError import FSError, INVALID_COMMENT, NO_FREE_BLOCKS
 from amitools.fs.FSString import FSString
+from amitools.fs.FileName import FileName
+from amitools.fs.Imager import Imager
 from amitools.fs.MetaInfo import MetaInfo
 from amitools.fs.blkdev.ADFBlockDevice import ADFBlockDevice
+from amitools.fs.block.Block import Block
 from amitools.fs.block.CommentBlock import CommentBlock
 from amitools.fs.block.FileHeaderBlock import FileHeaderBlock
+from amitools.fs.block.RootBlock import RootBlock
+from amitools.fs.block.UserDirBlock import UserDirBlock
 from amitools.fs.validate.Log import Log
 from amitools.fs.validate.Validator import Validator
 import amitools.fs.DosType as DosType
+from amitools.tools.xdftool import main as xdftool_main
 
 DOS_TYPES = [DosType.DOS0 + n for n in range(8)]
 DIRCACHE_DOS_TYPES = [DosType.DOS4, DosType.DOS5]
@@ -368,6 +376,20 @@ def fs_comment_longname_block_usage_test(tmp_path, dos_type):
     close_volume(blkdev, volume)
 
 
+@pytest.mark.parametrize("dos_type", DOS_TYPES, ids=dos_id)
+def fs_root_dir_block_nums_test(tmp_path, dos_type):
+    # The root block has no comment block. The root directory lists its own
+    # block and, on DOS4/5, its dircache block.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    root = volume.get_root_dir()
+    want = [880, 866] if dos_type in DIRCACHE_DOS_TYPES else [880]
+    assert root.get_block_nums() == want
+    assert [b.blk_num for b in root.get_blocks()] == want
+    assert root.get_block_usage() == (0, len(want))
+    close_volume(blkdev, volume)
+
+
 @pytest.mark.parametrize("keep", [2, 3], ids=["no_room", "room"])
 @pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
 def fs_comment_longname_create_disk_full_test(tmp_path, dos_type, keep):
@@ -468,6 +490,15 @@ KEEPER = "k" * 60
 VICTIM = "v" * 60
 
 
+FOREIGN_POINTERS = [
+    "other_entry",
+    "file_header",
+    "out_of_range",
+    "free_block",
+    "data_block",
+]
+
+
 def make_foreign_comment_pointer(image, dos_type, kind):
     """a long name volume whose VICTIM points to a comment block that is
     not its own; returns the block number it points to"""
@@ -477,40 +508,37 @@ def make_foreign_comment_pointer(image, dos_type, kind):
     keeper.change_comment(FSString("k" * 79))
     volume.write_file(b"data", FSString(VICTIM))
     victim = volume.get_path_name(FSString(VICTIM))
-    if kind == "bad_checksum":
-        victim.change_comment(FSString("v" * 79))
     target = {
         "other_entry": keeper.block.comment_block_id,
         "file_header": keeper.block.blk_num,
-        "bad_checksum": victim.block.comment_block_id,
         "out_of_range": blkdev.num_blocks + 1,
+        "free_block": blkdev.num_blocks - 1,
+        "data_block": keeper.data_blk_nums[0],
     }[kind]
+    if kind == "free_block":
+        assert volume.bitmap.get_bit(target)
     victim_num = victim.block.blk_num
     close_volume(blkdev, volume)
 
     blkdev = ADFBlockDevice(str(image))
     blkdev.open()
-    if kind == "bad_checksum":
-        data = bytearray(blkdev.read_block(target))
-        data[30] ^= 0xFF
-        blkdev.write_block(target, data)
-    else:
-        hdr = FileHeaderBlock(blkdev, victim_num, is_longname=True)
-        hdr.read()
-        hdr.comment_block_id = target
-        hdr.write()
+    if kind == "free_block":
+        # data left over in a free block, not a valid block
+        blkdev.write_block(target, b"\xa5" * blkdev.block_bytes)
+    hdr = FileHeaderBlock(blkdev, victim_num, is_longname=True)
+    hdr.read()
+    hdr.comment_block_id = target
+    hdr.write()
     blkdev.close()
     return target
 
 
 @pytest.mark.parametrize("op", ["delete", "shrink", "grow"])
-@pytest.mark.parametrize(
-    "kind", ["other_entry", "file_header", "bad_checksum", "out_of_range"]
-)
+@pytest.mark.parametrize("kind", FOREIGN_POINTERS)
 @pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
 def fs_comment_block_not_owned_test(tmp_path, dos_type, kind, op):
-    # An entry frees or rewrites only a comment block that is valid and names
-    # the entry as its header. Any other pointer counts as no comment block.
+    # An entry frees or rewrites only its own comment block. Any other
+    # pointer counts as no comment block.
     image = tmp_path / "test.adf"
     target = make_foreign_comment_pointer(image, dos_type, kind)
     blkdev, volume = open_volume(image)
@@ -540,9 +568,538 @@ def fs_comment_block_not_owned_test(tmp_path, dos_type, kind, op):
         want = "short" if op == "shrink" else "g" * 79
         assert get_comment(volume, VICTIM) == FSString(want)
     close_volume(blkdev, volume)
-    # a comment block with a bad checksum stays allocated: it may be anyone's
-    if kind != "bad_checksum":
-        assert validate(image) == []
+    assert validate(image) == []
+
+
+@pytest.mark.parametrize("kind", FOREIGN_POINTERS)
+@pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
+def fs_comment_block_not_owned_kept_test(tmp_path, dos_type, kind):
+    # A change that leaves the comment alone writes the header back without
+    # a pointer to a block that is not the entry's comment block: that
+    # block is, or may become, another entry's, as when the next file takes
+    # the blocks of KEEPER once it is deleted.
+    image = tmp_path / "test.adf"
+    make_foreign_comment_pointer(image, dos_type, kind)
+    blkdev, volume = open_volume(image)
+    free = volume.get_free_blocks()
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.get_block_nums() == [node.block.blk_num] + node.data_blk_nums
+    assert node.get_block_usage() == (1, 1)
+    node.change_protect(0x0F)
+    assert volume.get_free_blocks() == free
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.block.comment_block_id == 0
+    volume.delete(FSString(KEEPER))
+    volume.write_file(b"g" * 3000, FSString("g"))
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+def make_victim_comment_block(image, dos_type):
+    """a long name volume whose VICTIM has a comment in a comment block;
+    returns the block numbers of its header and comment block"""
+    blkdev, volume = create_volume(image, dos_type)
+    volume.write_file(b"data", FSString(VICTIM))
+    victim = volume.get_path_name(FSString(VICTIM))
+    victim.change_comment(FSString("v" * 79))
+    nums = victim.block.blk_num, victim.block.comment_block_id
+    close_volume(blkdev, volume)
+    return nums
+
+
+def flip_comment_byte(image, blk_num):
+    """invert a byte of the comment in comment block blk_num, which makes
+    its checksum bad: twice restores it"""
+    blkdev = ADFBlockDevice(str(image))
+    blkdev.open()
+    data = bytearray(blkdev.read_block(blk_num))
+    data[30] ^= 0xFF
+    blkdev.write_block(blk_num, data)
+    blkdev.close()
+
+
+@pytest.mark.parametrize("op", ["protect", "delete", "shrink", "grow"])
+@pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
+def fs_comment_block_bad_checksum_test(tmp_path, dos_type, op):
+    # A comment block that reads as the entry's own apart from its checksum
+    # is still the entry's. Its comment cannot be read, but a protection
+    # change keeps the pointer, so that the comment is back once the block
+    # is repaired; a delete frees the block, a comment that needs a comment
+    # block rewrites it, and a shorter comment frees it.
+    image = tmp_path / "test.adf"
+    hdr_num, target = make_victim_comment_block(image, dos_type)
+    flip_comment_byte(image, target)
+
+    blkdev, volume = open_volume(image)
+    free = volume.get_free_blocks()
+    assert get_comment(volume, VICTIM) == FSString()
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.get_block_nums() == [hdr_num, target] + node.data_blk_nums
+    assert node.get_block_usage() == (1, 2)
+    if op == "protect":
+        node.change_protect(0x0F)
+    elif op == "delete":
+        volume.delete(FSString(VICTIM))
+    elif op == "shrink":
+        node.change_comment(FSString("short"))
+    else:
+        node.change_comment(FSString("g" * 79))
+    freed = {"protect": 0, "delete": 3, "shrink": 1, "grow": 0}[op]
+    assert volume.get_free_blocks() == free + freed
+    assert volume.bitmap.get_bit(target) == (op in ("delete", "shrink"))
+    close_volume(blkdev, volume)
+
+    if op == "protect":
+        flip_comment_byte(image, target)
+    blkdev, volume = open_volume(image)
+    if op == "delete":
+        assert volume.get_path_name(FSString(VICTIM)) is None
+    else:
+        want = {"protect": "v" * 79, "shrink": "short", "grow": "g" * 79}[op]
+        assert get_comment(volume, VICTIM) == FSString(want)
+        node = volume.get_path_name(FSString(VICTIM))
+        assert node.block.comment_block_id == (0 if op == "shrink" else target)
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+@pytest.mark.parametrize("op", ["protect", "delete", "shrink", "grow"])
+@pytest.mark.parametrize("damaged", [False, True], ids=["valid", "bad_checksum"])
+@pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
+def fs_comment_block_free_test(tmp_path, dos_type, damaged, op):
+    # A comment block that the bitmap marks free, as when the bitmap was
+    # not written after a change, is no longer the entry's, whatever it
+    # reads as: the next file takes it. The entry neither frees nor
+    # rewrites it, and its header no longer points to it. Its comment is
+    # still read, if it can be, and the next header write of the entry
+    # moves it to a new comment block.
+    image = tmp_path / "test.adf"
+    hdr_num, target = make_victim_comment_block(image, dos_type)
+    blkdev, volume = open_volume(image)
+    volume.bitmap.dealloc_n([target])
+    close_volume(blkdev, volume)
+    if damaged:
+        flip_comment_byte(image, target)
+
+    blkdev, volume = open_volume(image)
+    kept = "" if damaged else "v" * 79
+    assert get_comment(volume, VICTIM) == FSString(kept)
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.get_block_nums() == [hdr_num] + node.data_blk_nums
+    assert node.get_block_usage() == (1, 1)
+    volume.write_file(b"n" * 2000, FSString("new"))
+    assert target in volume.get_path_name(FSString("new")).get_block_nums()
+    free = volume.get_free_blocks()
+    if op == "protect":
+        node.change_protect(0x0F)
+    elif op == "delete":
+        volume.delete(FSString(VICTIM))
+    elif op == "shrink":
+        node.change_comment(FSString("short"))
+    else:
+        node.change_comment(FSString("g" * 79))
+    moved = 0 if damaged else -1
+    freed = {"protect": moved, "delete": 2, "shrink": 0, "grow": -1}[op]
+    assert volume.get_free_blocks() == free + freed
+    want = {"protect": kept, "shrink": "short", "grow": "g" * 79}.get(op)
+    if want is not None:
+        assert get_comment(volume, VICTIM) == FSString(want)
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    assert volume.read_file(FSString("new")) == b"n" * 2000
+    if op == "delete":
+        assert volume.get_path_name(FSString(VICTIM)) is None
+    else:
+        assert get_comment(volume, VICTIM) == FSString(want)
+        node = volume.get_path_name(FSString(VICTIM))
+        assert node.block.comment_block_id != target
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+def fs_comment_block_free_copy_test(tmp_path):
+    # A comment block that the bitmap marks free when the volume is opened
+    # is not the entry's again once a file takes it, even if that file
+    # fills it with a copy of what it held: deleting the entry leaves it.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, DosType.DOS7)
+    # a free block in front, for the header of the next file
+    volume.write_file(b"", FSString("pad"))
+    volume.write_file(b"data", FSString(VICTIM))
+    victim = volume.get_path_name(FSString(VICTIM))
+    victim.change_comment(FSString("v" * 79))
+    target = victim.block.comment_block_id
+    volume.delete(FSString("pad"))
+    data = bytes(blkdev.read_block(target)) * 4
+    volume.bitmap.dealloc_n([target])
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    volume.write_file(data, FSString("new"))
+    assert target in volume.get_path_name(FSString("new")).data_blk_nums
+    volume.delete(FSString(VICTIM))
+    assert not volume.bitmap.get_bit(target)
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    assert volume.read_file(FSString("new")) == data
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+@pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
+def fs_comment_block_free_read_only_test(tmp_path, dos_type, capsys):
+    # A volume whose bitmap was not written after a change, as after a
+    # crash, is opened read-only to rescue its files: a comment in a block
+    # that the bitmap marks free still reads, lists and unpacks.
+    image = tmp_path / "test.adf"
+    hdr_num, target = make_victim_comment_block(image, dos_type)
+    blkdev, volume = open_volume(image)
+    volume.bitmap.dealloc_n([target])
+    root_num = volume.root.blk_num
+    close_volume(blkdev, volume)
+    blkdev = ADFBlockDevice(str(image))
+    blkdev.open()
+    root = RootBlock(blkdev, root_num)
+    root.read()
+    root.bitmap_flag = 0
+    root.write()
+    blkdev.close()
+
+    blkdev = ADFBlockDevice(str(image), read_only=True)
+    blkdev.open()
+    volume = ADFSVolume(blkdev)
+    volume.open()
+    assert get_comment(volume, VICTIM) == FSString("v" * 79)
+    out = tmp_path / "out"
+    Imager().unpack(volume, str(out))
+    close_volume(blkdev, volume)
+    meta = (tmp_path / "out.xdfmeta").read_text()
+    assert "%s:" % VICTIM in meta and "v" * 79 in meta
+    capsys.readouterr()
+    assert xdftool_main([str(image), "list"]) == 0
+    assert "v" * 79 in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("op", ["create_in", "delete_in", "delete_next"])
+@pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
+def fs_comment_block_free_header_write_test(tmp_path, dos_type, op):
+    # A create or delete that writes the header of the directory, or of the
+    # entry in front of the deleted one, whose comment block the bitmap
+    # marks free, first moves its comment to a new comment block, also
+    # without the time stamp change that follows.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    if op == "delete_next":
+        mate = hash_mate(volume, VICTIM, "t")
+        volume.write_file(b"t", FSString(mate))
+        volume.write_file(b"data", FSString(VICTIM))
+    else:
+        volume.create_dir(FSString(VICTIM))
+        volume.write_file(b"e", FSString(VICTIM + "/e"))
+    victim = volume.get_path_name(FSString(VICTIM))
+    victim.change_comment(FSString("v" * 79))
+    victim_num, target = victim.block.blk_num, victim.block.comment_block_id
+    volume.bitmap.dealloc_n([target])
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    volume.write_file(b"n" * 2000, FSString("new"))
+    assert target in volume.get_path_name(FSString("new")).get_block_nums()
+    if op == "create_in":
+        node = volume.get_path_name(FSString(VICTIM))
+        node.create_file(FSString("x"), b"x", update_ts=False)
+    elif op == "delete_in":
+        volume.get_path_name(FSString(VICTIM + "/e")).delete(update_ts=False)
+    else:
+        volume.get_path_name(FSString(mate)).delete(update_ts=False)
+    assert get_comment(volume, VICTIM) == FSString("v" * 79)
+    close_volume(blkdev, volume)
+
+    assert header_comment_block_id(image, victim_num) not in (0, target)
+    blkdev, volume = open_volume(image)
+    assert get_comment(volume, VICTIM) == FSString("v" * 79)
+    assert volume.read_file(FSString("new")) == b"n" * 2000
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+@pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
+def fs_comment_block_bitmap_block_test(tmp_path, dos_type):
+    # A bitmap block is always allocated, and its first long is its own
+    # checksum, so that it can read as an entry's comment block. It is the
+    # volume's: deleting the entry does not free it, and the next file
+    # does not take it.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    volume.write_file(b"data", FSString(VICTIM))
+    victim_num = volume.get_path_name(FSString(VICTIM)).block.blk_num
+    bm_num = volume.bitmap.bitmap_blks[0].blk_num
+    close_volume(blkdev, volume)
+    blkdev = ADFBlockDevice(str(image))
+    blkdev.open()
+    longs = list(struct.unpack(">128I", blkdev.read_block(bm_num)))
+    longs[0:3] = [Block.T_COMMENT, bm_num, victim_num]
+    # a comment of 0 bytes: free blocks have their bits set
+    longs[6] &= 0x00FFFFFF
+    # long 127 lies past the bitmap: it makes the checksum right again
+    longs[127] = (longs[127] - sum(longs)) & 0xFFFFFFFF
+    blkdev.write_block(bm_num, struct.pack(">128I", *longs))
+    hdr = FileHeaderBlock(blkdev, victim_num, is_longname=True)
+    hdr.read()
+    hdr.comment_block_id = bm_num
+    hdr.write()
+    blkdev.close()
+
+    blkdev, volume = open_volume(image)
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.get_block_nums() == [victim_num] + node.data_blk_nums
+    volume.delete(FSString(VICTIM))
+    assert not volume.bitmap.get_bit(bm_num)
+    volume.write_file(b"n" * 10000, FSString("new"))
+    assert bm_num not in volume.get_path_name(FSString("new")).get_block_nums()
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    assert volume.read_file(FSString("new")) == b"n" * 10000
+    close_volume(blkdev, volume)
+
+
+def hash_mate(volume, name, prefix):
+    """a name made of prefix and a number that hashes as name does"""
+
+    def hash_of(name):
+        return FileName(FSString(name), volume.is_intl, volume.is_longname).hash()
+
+    n = 0
+    while hash_of("%s%d" % (prefix, n)) != hash_of(name):
+        n += 1
+    return "%s%d" % (prefix, n)
+
+
+def make_comment_like_data(image, kind="file", length=0):
+    """a DOS7 volume whose VICTIM, a file or a directory, points to the
+    first data block of KEEPER, raw file data that reads as a comment block
+    of VICTIM apart from its checksum, with a comment of length bytes. A
+    directory holds "e", unless it is an empty one; a file is in front of
+    the one other entry of its hash chain, whose name is returned. Returns
+    that name and the numbers of the header of VICTIM and of that block"""
+    blkdev, volume = create_volume(image, DosType.DOS7)
+    mate = None
+    if kind in ("dir", "empty_dir"):
+        volume.create_dir(FSString(VICTIM))
+        if kind == "dir":
+            volume.write_file(b"e", FSString(VICTIM + "/e"))
+    else:
+        mate = hash_mate(volume, VICTIM, "t")
+        volume.write_file(b"t", FSString(mate))
+        volume.write_file(b"data", FSString(VICTIM))
+    victim_num = volume.get_path_name(FSString(VICTIM)).block.blk_num
+    volume.write_file(b"k" * 600, FSString(KEEPER))
+    target = volume.get_path_name(FSString(KEEPER)).data_blk_nums[0]
+    close_volume(blkdev, volume)
+    blkdev = ADFBlockDevice(str(image))
+    blkdev.open()
+    data = bytearray(blkdev.read_block(target))
+    data[0:12] = struct.pack(">III", Block.T_COMMENT, target, victim_num)
+    data[24] = length
+    blkdev.write_block(target, data)
+    if kind != "file":
+        hdr = UserDirBlock(blkdev, victim_num, is_longname=True)
+    else:
+        hdr = FileHeaderBlock(blkdev, victim_num, is_longname=True)
+    hdr.read()
+    hdr.comment_block_id = target
+    hdr.write()
+    blkdev.close()
+    return mate, victim_num, target
+
+
+def take_comment_like_data(volume, target, taken=True):
+    """delete KEEPER, and let the next file take its block target"""
+    volume.delete(FSString(KEEPER))
+    if taken:
+        volume.write_file(b"n" * 600, FSString("new"))
+        assert target in volume.get_path_name(FSString("new")).data_blk_nums
+
+
+def header_comment_block_id(image, blk_num):
+    """the comment block pointer on disk of long name header blk_num"""
+    blkdev = ADFBlockDevice(str(image), read_only=True)
+    blkdev.open()
+    blk = Block(blkdev, blk_num)
+    blk.read()
+    blk_id = blk._get_long(-18)
+    blkdev.close()
+    return blk_id
+
+
+def fs_comment_block_file_data_test(tmp_path):
+    # FFS data blocks hold raw file data, which may read as any block: here
+    # the first data block of KEEPER reads as a comment block of VICTIM,
+    # whose header points to it. Once KEEPER is deleted and the next file
+    # takes that block, it is no longer VICTIM's, and VICTIM's next header
+    # write drops the pointer.
+    image = tmp_path / "test.adf"
+    mate, victim_num, target = make_comment_like_data(image)
+    blkdev, volume = open_volume(image)
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.get_block_nums() == [victim_num, target] + node.data_blk_nums
+    take_comment_like_data(volume, target)
+    assert node.get_block_nums() == [victim_num] + node.data_blk_nums
+    node.change_protect(0x0F)
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    assert volume.get_path_name(FSString(VICTIM)).block.comment_block_id == 0
+    assert volume.read_file(FSString("new")) == b"n" * 600
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+@pytest.mark.parametrize("op", ["shrink", "grow"])
+@pytest.mark.parametrize("taken", [True, False], ids=["taken", "free"])
+def fs_comment_block_file_data_change_test(tmp_path, taken, op):
+    # A comment change checks again that the comment block is still the
+    # entry's: once KEEPER is deleted, and maybe the next file takes its
+    # block, a shorter comment does not free it, and a longer one does not
+    # rewrite it but takes a new block.
+    image = tmp_path / "test.adf"
+    mate, victim_num, target = make_comment_like_data(image)
+    blkdev, volume = open_volume(image)
+    take_comment_like_data(volume, target, taken)
+    free = volume.get_free_blocks()
+    node = volume.get_path_name(FSString(VICTIM))
+    if not taken:
+        # block counts go by the bitmap only
+        assert node.get_block_usage() == (1, 1)
+    want = "short" if op == "shrink" else "g" * 79
+    node.change_comment(FSString(want))
+    assert volume.get_free_blocks() == free - (op == "grow")
+    assert volume.bitmap.get_bit(target) != taken
+    close_volume(blkdev, volume)
+
+    assert header_comment_block_id(image, victim_num) != target
+    blkdev, volume = open_volume(image)
+    if taken:
+        assert volume.read_file(FSString("new")) == b"n" * 600
+    assert get_comment(volume, VICTIM) == FSString(want)
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+def fs_comment_block_file_data_dir_delete_test(tmp_path):
+    # Deleting a directory checks again that its comment block is still
+    # its own, and does not free the block of the next file.
+    image = tmp_path / "test.adf"
+    mate, victim_num, target = make_comment_like_data(image, kind="empty_dir")
+    blkdev, volume = open_volume(image)
+    take_comment_like_data(volume, target)
+    volume.delete(FSString(VICTIM))
+    assert not volume.bitmap.get_bit(target)
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    assert volume.read_file(FSString("new")) == b"n" * 600
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+@pytest.mark.parametrize("op", ["create_in", "delete_in", "delete_next"])
+def fs_comment_block_file_data_header_write_test(tmp_path, op):
+    # A create or delete writes the header of the directory, or of the
+    # entry in front of the deleted one in its hash chain: that header,
+    # too, drops a pointer to a block that is no longer its comment block,
+    # also without the time stamp change that follows, as xdftool pack and
+    # repack create and delete entries.
+    image = tmp_path / "test.adf"
+    kind = "file" if op == "delete_next" else "dir"
+    mate, victim_num, target = make_comment_like_data(image, kind=kind)
+    blkdev, volume = open_volume(image)
+    take_comment_like_data(volume, target)
+    if op == "create_in":
+        node = volume.get_path_name(FSString(VICTIM))
+        node.create_file(FSString("x"), b"x", update_ts=False)
+    elif op == "delete_in":
+        volume.get_path_name(FSString(VICTIM + "/e")).delete(update_ts=False)
+    else:
+        volume.get_path_name(FSString(mate)).delete(update_ts=False)
+    close_volume(blkdev, volume)
+
+    assert header_comment_block_id(image, victim_num) == 0
+    blkdev, volume = open_volume(image)
+    assert volume.read_file(FSString("new")) == b"n" * 600
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+@pytest.mark.parametrize("op", ["protect", "delete", "shrink", "grow"])
+def fs_comment_block_file_data_long_comment_test(tmp_path, op):
+    # File data that reads as an entry's comment block apart from its
+    # checksum, but with a comment longer than 79 bytes, is no comment
+    # block: the entry neither frees nor rewrites it, and its header no
+    # longer points to it.
+    image = tmp_path / "test.adf"
+    mate, victim_num, target = make_comment_like_data(image, length=107)
+    blkdev, volume = open_volume(image)
+    keeper = volume.read_file(FSString(KEEPER))
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.get_block_nums() == [victim_num] + node.data_blk_nums
+    if op == "protect":
+        node.change_protect(0x0F)
+    elif op == "delete":
+        volume.delete(FSString(VICTIM))
+    elif op == "shrink":
+        node.change_comment(FSString("short"))
+    else:
+        node.change_comment(FSString("g" * 79))
+    assert not volume.bitmap.get_bit(target)
+    close_volume(blkdev, volume)
+
+    if op != "delete":
+        assert header_comment_block_id(image, victim_num) != target
+    blkdev, volume = open_volume(image)
+    assert volume.read_file(FSString(KEEPER)) == keeper
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+def fs_comment_block_read_count_test(tmp_path, monkeypatch):
+    # Reading a directory reads each comment block once. Block counts and
+    # the bitmap drawing go by the bitmap, without a read.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, DosType.DOS7)
+    volume.create_dir(FSString("dir"))
+    want = []
+    for n in range(5):
+        path = FSString("dir/%s%d" % ("f" * 60, n))
+        volume.write_file(b"data", path)
+        node = volume.get_path_name(path)
+        node.change_comment(FSString("c" * 79))
+        want += [node.block.blk_num, node.block.comment_block_id]
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    node = volume.get_path_name(FSString("dir"))
+    read_block = ADFBlockDevice.read_block
+    reads = []
+
+    def counting_read_block(self, num):
+        reads.append(num)
+        return read_block(self, num)
+
+    monkeypatch.setattr(ADFBlockDevice, "read_block", counting_read_block)
+    node.get_entries()
+    assert sorted(reads) == sorted(want)
+    del reads[:]
+    assert node.get_block_usage(all=True) == (5, 11)
+    node.draw_on_bitmap([0] * blkdev.num_blocks, True)
+    assert reads == []
+    close_volume(blkdev, volume)
 
 
 @pytest.mark.parametrize("length", [80, 256])
