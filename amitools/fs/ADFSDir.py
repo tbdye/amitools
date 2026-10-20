@@ -189,7 +189,7 @@ class ADFSDir(ADFSNode):
         if extra_comment is not None:
             self._check_comment(extra_comment, file_name=name)
         # a long name comment that does not fit beside the name in the header
-        # goes into a comment block, allocated along with the node's blocks
+        # goes into a comment block, added once the node's blocks are written
         if (
             self.volume.is_longname
             and extra_comment is not None
@@ -208,8 +208,6 @@ class ADFSDir(ADFSNode):
 
         # return the number of blocks required to create this node
         num_blks = node.blocks_get_create_num()
-        if extra_comment is not None:
-            num_blks += 1
 
         # try to find free blocks
         free_blks = self.volume.bitmap.alloc_n(num_blks)
@@ -217,45 +215,49 @@ class ADFSDir(ADFSNode):
             raise FSError(
                 NO_FREE_BLOCKS, node=self, file_name=name, extra="want %d" % num_blks
             )
-        if extra_comment is not None:
-            comment_blk_num = free_blks.pop()
 
-        # now create the blocks for this node
-        new_blk = node.blocks_create_new(
-            free_blks, name, hash_chain_blk, self.block.blk_num, meta_info
-        )
-        # write the comment block, then point the header to it
-        if extra_comment is not None:
-            try:
-                node._write_comment_block(comment_blk_num, extra_comment)
-                node.block.comment_block_id = comment_blk_num
-                node.block.write()
-            except Exception:
-                # nothing links the new node yet: release all of its blocks
-                self.volume.bitmap.dealloc_n(free_blks + [comment_blk_num])
-                raise
-            node.comment_blk_num = comment_blk_num
-            node.meta_info.set_comment(extra_comment)
-
-        # dircache: create record for this node
-        if self.volume.is_dircache:
-            ok = self._dircache_add_entry(
-                name,
-                meta_info,
-                new_blk,
-                node.get_size(),
-                update_myself=False,
-                sub_type=Block.ST_USERDIR if node.is_dir() else Block.ST_FILE,
+        # nothing links the node until my hash table is written: up to then,
+        # a failure releases all blocks taken for it
+        old_hash_blk = self.block.hash_table[fn_hash]
+        has_dircache_record = False
+        try:
+            # now create the blocks for this node
+            new_blk = node.blocks_create_new(
+                free_blks, name, hash_chain_blk, self.block.blk_num, meta_info
             )
-            if not ok:
-                self.delete()
-                raise FSError(
-                    NO_FREE_BLOCKS, node=self, file_name=name, extra="want dcache"
-                )
+            if extra_comment is not None:
+                node.change_comment(extra_comment)
 
-        # update my dir
-        self.block.hash_table[fn_hash] = new_blk
-        self.block.write()
+            # dircache: create record for this node
+            if self.volume.is_dircache:
+                ok = self._dircache_add_entry(
+                    name,
+                    meta_info,
+                    new_blk,
+                    node.get_size(),
+                    update_myself=False,
+                    sub_type=Block.ST_USERDIR if node.is_dir() else Block.ST_FILE,
+                )
+                if not ok:
+                    raise FSError(
+                        NO_FREE_BLOCKS, node=self, file_name=name, extra="want dcache"
+                    )
+                has_dircache_record = True
+
+            # update my dir
+            self.block.hash_table[fn_hash] = new_blk
+            self.block.write()
+        except Exception:
+            self.block.hash_table[fn_hash] = old_hash_blk
+            blk_nums = free_blks[:]
+            if node.comment_blk_num != 0:
+                blk_nums.append(node.comment_blk_num)
+            if node.is_dir() and node.dcache_blks:
+                blk_nums += [dcb.blk_num for dcb in node.dcache_blks]
+            self.volume.bitmap.dealloc_n(blk_nums)
+            if has_dircache_record:
+                self._dircache_remove_entry(name)
+            raise
 
         # add node
         self.name_hash[fn_hash].insert(0, node)
