@@ -354,27 +354,44 @@ class ADFSDir(ADFSNode):
         else:
             next_blk = names[pos + 1].block.blk_num
 
-        # remove node from the hash chain
+        # dircache: the record goes first, so that a failed write leaves
+        # the entry as it was
+        record = None
+        free_dcb_nums = []
+        if self.volume.is_dircache:
+            record = self.get_dircache_record(node)
+            free_dcb_nums = self._dircache_remove_entry(node)
+
+        # remove node from the hash chain. If that fails, the node is still
+        # linked on disk: link it here again and give it back its record
         if prev == None:
+            link_blk = self.block
             self.block.hash_table[hash_key] = next_blk
-            self.block.write()
         else:
+            link_blk = prev.block
             prev.block.hash_chain = next_blk
-            prev.block.write()
+        try:
+            link_blk.write()
+        except Exception:
+            if prev == None:
+                self.block.hash_table[hash_key] = node.block.blk_num
+            else:
+                prev.block.hash_chain = node.block.blk_num
+            if record != None:
+                try:
+                    self._dircache_add_entry_int(record)
+                except Exception:
+                    # the entry stays, without a record
+                    pass
+            raise
 
         # remove from my lists
         self.entries.remove(node)
         names.remove(node)
 
-        # remove blocks of node in bitmap
+        # nothing links the node any more: release its blocks
         blk_nums = node.get_block_nums()
         self.volume.bitmap.dealloc_n(blk_nums)
-
-        # dircache?
-        if self.volume.is_dircache:
-            free_dcb_nums = self._dircache_remove_entry(node)
-        else:
-            free_dcb_nums = []
 
         # (optional) wipe blocks
         if wipe:
@@ -572,13 +589,10 @@ class ADFSDir(ADFSNode):
         return result
 
     def _dircache_remove_entry(self, node, update_myself=True):
-        """remove all dircache records of node; returns the numbers of the
-        dircache blocks freed"""
-        records = self._dircache_records(node.block.blk_num)
-        if not records:
-            raise FSError(INTERNAL_ERROR, node=self, extra="no dc record!")
+        """remove all dircache records of node, if any; returns the numbers
+        of the dircache blocks freed"""
         freed = []
-        for dcb, record in records:
+        for dcb, record in self._dircache_records(node.block.blk_num):
             blk_num = self._dircache_remove_record(dcb, record, update_myself)
             if blk_num != None:
                 freed.append(blk_num)

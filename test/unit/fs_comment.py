@@ -3,8 +3,10 @@ import pytest
 from amitools.fs.ADFSVolume import ADFSVolume
 from amitools.fs.FSError import FSError, INVALID_COMMENT, NO_FREE_BLOCKS
 from amitools.fs.FSString import FSString
+from amitools.fs.FileName import FileName
 from amitools.fs.MetaInfo import MetaInfo
 from amitools.fs.blkdev.ADFBlockDevice import ADFBlockDevice
+from amitools.fs.block.Block import Block
 from amitools.fs.block.CommentBlock import CommentBlock
 from amitools.fs.block.DirCacheBlock import DirCacheBlock, DirCacheRecord
 from amitools.fs.block.FileDataBlock import FileDataBlock
@@ -425,7 +427,8 @@ def fail_write(self):
 
 
 def fail_nth_write(monkeypatch, cls, nth):
-    """make the nth write of a cls block fail, and only that one"""
+    """make the nth write of a cls block fail, and only that one, or none
+    for nth 0; returns the blocks whose write was tried"""
     write = cls.write
     calls = []
 
@@ -436,6 +439,7 @@ def fail_nth_write(monkeypatch, cls, nth):
         write(self)
 
     monkeypatch.setattr(cls, "write", failing_write)
+    return calls
 
 
 @pytest.mark.parametrize("nth", [1, 2, 3], ids=["block", "link", "leave"])
@@ -796,6 +800,80 @@ def fs_create_dircache_disk_full_test(tmp_path, dos_type, where, kind):
     check_dircache(volume, parent, {})
     close_volume(blkdev, volume)
     assert validate(image) == []
+
+
+def same_hash_name(volume, name):
+    """a name in the same hash chain as name"""
+
+    def hash_of(n):
+        fn = FileName(FSString(n), volume.is_intl, volume.is_longname)
+        return fn.hash()
+
+    n = 0
+    while hash_of("g%d" % n) != hash_of(name):
+        n += 1
+    return "g%d" % n
+
+
+def make_delete_target(volume, target):
+    """fill "dir" with 17 files, which fill a dircache block, and add the
+    entry to delete; returns its path"""
+    volume.create_dir(FSString("dir"))
+    fill_dir(volume, 17)
+    if target == "dir":
+        volume.create_dir(FSString("dir/sub"))
+        return "dir/sub"
+    if target == "lone":
+        # alone in the second dircache block
+        volume.write_file(b"x", FSString("dir/f17"))
+        return "dir/f17"
+    # two files in one hash chain: the one created last is its head
+    other = FSString("dir/" + same_hash_name(volume, "tgt"))
+    if target == "head":
+        volume.write_file(b"o" * 600, other)
+    volume.write_file(b"t" * 600, FSString("dir/tgt"))
+    if target == "tail":
+        volume.write_file(b"o" * 600, other)
+    return "dir/tgt"
+
+
+@pytest.mark.parametrize("target", ["head", "tail", "dir", "lone"])
+@pytest.mark.parametrize("dos_type", DOS_TYPES, ids=dos_id)
+def fs_delete_write_fails_test(tmp_path, dos_type, target, monkeypatch):
+    # Make each block write of a delete fail in turn: the removal of the
+    # dircache record, the unlink from the directory or from the entry
+    # before it in its hash chain, and the new time stamps. The entry is
+    # then either kept, with all its blocks, or gone, with all of them
+    # free, in memory as on disk. The image stays valid when the next file
+    # takes the free blocks and all headers of the directory are written.
+    blkdev, volume = create_volume(tmp_path / "ref.adf", dos_type)
+    path = make_delete_target(volume, target)
+    free = volume.get_free_blocks()
+    with monkeypatch.context() as patch:
+        writes = fail_nth_write(patch, Block, 0)
+        volume.delete(FSString(path))
+    freed = volume.get_free_blocks() - free
+    close_volume(blkdev, volume)
+
+    for nth in range(1, len(writes) + 1):
+        image = tmp_path / ("test%d.adf" % nth)
+        blkdev, volume = create_volume(image, dos_type)
+        make_delete_target(volume, target)
+        with monkeypatch.context() as patch:
+            fail_nth_write(patch, Block, nth)
+            with pytest.raises(IOError):
+                volume.delete(FSString(path))
+        gone = volume.get_path_name(FSString(path)) is None
+        assert volume.get_free_blocks() == free + (freed if gone else 0)
+        volume.write_file(b"n" * 600, FSString("dir/next"))
+        for node in volume.get_path_name(FSString("dir")).get_entries():
+            node.change_protect(0x0F)
+        close_volume(blkdev, volume)
+
+        blkdev, volume = open_volume(image)
+        assert (volume.get_path_name(FSString(path)) is None) == gone
+        close_volume(blkdev, volume)
+        assert validate(image) == [], "write %d" % nth
 
 
 KEEPER = "k" * 60
