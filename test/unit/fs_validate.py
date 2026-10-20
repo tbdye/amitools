@@ -9,6 +9,7 @@ from amitools.fs.blkdev.ADFBlockDevice import ADFBlockDevice
 from amitools.fs.block.Block import Block
 from amitools.fs.block.CommentBlock import CommentBlock
 from amitools.fs.block.DirCacheBlock import DirCacheBlock, DirCacheRecord
+from amitools.fs.block.UserDirBlock import UserDirBlock
 from amitools.fs.validate.Log import Log
 from amitools.fs.validate.Validator import Validator
 import amitools.fs.DosType as DosType
@@ -308,6 +309,59 @@ def fs_validate_dircache_overrun_delete_dir_test(tmp_path, dos_type):
     blkdev, volume = open_volume(image)
     with pytest.raises(FSError) as error:
         volume.delete(FSString("empty"))
+    assert error.value.code == INVALID_DIR_CACHE_BLOCK
+    close_volume(blkdev, volume)
+    assert image.read_bytes() == before
+
+
+@pytest.mark.parametrize("kind", ["loop", "other_dir", "out_of_range", "own_key"])
+@pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
+def fs_validate_dircache_chain_test(tmp_path, dos_type, kind, capsys):
+    # A dircache chain that links a block twice, a block of another
+    # directory or a block off the disk, or holds a block with a wrong own
+    # key, is an invalid dircache: the directory lists, but a change that
+    # would move a record into such a block is refused.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    volume.create_dir(FSString("P"))
+    volume.create_dir(FSString("Q"))
+    volume.write_file(b"q", FSString("Q/qfile"))
+    # 17 records fill a dircache block
+    for n in range(17):
+        volume.write_file(b"x", FSString("P/f%02d" % n))
+    p_node = volume.get_path_name(FSString("P"))
+    p_num = p_node.block.blk_num
+    p_dcb = p_node.block.extension
+    q_dcb = volume.get_path_name(FSString("Q")).block.extension
+    close_volume(blkdev, volume)
+
+    def relink(dcb):
+        if kind == "loop":
+            dcb.next_cache = p_dcb
+        elif kind == "other_dir":
+            dcb.next_cache = q_dcb
+        else:
+            dcb.own_key += 1
+        dcb.write()
+
+    if kind == "out_of_range":
+        blkdev = ADFBlockDevice(str(image))
+        blkdev.open()
+        ud = UserDirBlock(blkdev, p_num)
+        ud.read()
+        ud.extension = 5000
+        ud.write()
+        blkdev.close()
+    else:
+        rewrite_dircache_block(image, p_dcb, relink)
+    before = image.read_bytes()
+
+    capsys.readouterr()
+    assert xdftool_main([str(image), "list"]) == 0
+    assert "f16" in capsys.readouterr().out
+    blkdev, volume = open_volume(image)
+    with pytest.raises(FSError) as error:
+        volume.get_path_name(FSString("P/f00")).change_comment(FSString("c" * 79))
     assert error.value.code == INVALID_DIR_CACHE_BLOCK
     close_volume(blkdev, volume)
     assert image.read_bytes() == before

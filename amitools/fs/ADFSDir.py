@@ -112,14 +112,27 @@ class ADFSDir(ADFSNode):
             dcb_num = self.block.extension
             while dcb_num != 0:
                 dcb = DirCacheBlock(self.blkdev, dcb_num)
-                dcb.read()
-                if not dcb.valid:
+                if not self._read_dircache_block(dcb):
                     # the entries can still be read, but a change would drop
                     # the records that could not be read
                     self.dcache_bad_blk = dcb
                     break
                 self.dcache_blks.append(dcb)
                 dcb_num = dcb.next_cache
+
+    def _read_dircache_block(self, dcb):
+        """read the next block of my dircache chain. It must lie on the
+        disk, not be in the chain already, and be a valid dircache block
+        of mine"""
+        blk_num = dcb.blk_num
+        if blk_num < self.blkdev.reserved or blk_num >= self.blkdev.num_blocks:
+            return False
+        if blk_num in [b.blk_num for b in self.dcache_blks]:
+            return False
+        dcb.read()
+        if not dcb.valid:
+            return False
+        return dcb.own_key == blk_num and dcb.parent == self.block.blk_num
 
     def check_dircache(self):
         """refuse to change a directory whose dircache cannot be read"""
