@@ -165,7 +165,11 @@ class ADFSNode:
                 comment_blk_num = new_blk_num = blks[0]
 
         # change the header, and put it back as it was if a write fails
-        saved = vars(self.block).copy()
+        saved = {
+            name: getattr(self.block, name)
+            for name in ("protect", "mod_ts", "comment", "comment_block_id")
+            if hasattr(self.block, name)
+        }
         if protect:
             self.block.protect = protect
         if mod_ts:
@@ -188,7 +192,8 @@ class ADFSNode:
             if record:
                 self.parent.update_dircache_record(record, new_record)
         except Exception:
-            vars(self.block).update(saved)
+            for name, value in saved.items():
+                setattr(self.block, name, value)
             if header_written:
                 self.block.write()
             if new_blk_num != 0:
