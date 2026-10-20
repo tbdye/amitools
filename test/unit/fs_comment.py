@@ -1134,6 +1134,65 @@ def fs_comment_too_long_test(tmp_path, dos_type, length):
     assert validate(image) == []
 
 
+PACK_TS = "01.01.2020 00:00:00.00"
+
+
+def make_pack_tree(tmp_path, xdfmeta=None, uaem=None):
+    """a tree with a.txt and sub/b.txt to pack, with the comments given by
+    path in its .xdfmeta file and in .uaem files"""
+    tree = tmp_path / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "a.txt").write_bytes(b"data")
+    (tree / "sub" / "b.txt").write_bytes(b"data")
+    if xdfmeta is not None:
+        lines = ["Test:DOS0,%s,%s,%s" % (PACK_TS, PACK_TS, PACK_TS)]
+        for path, comment in xdfmeta.items():
+            lines.append("%s:rwed,%s,%s" % (path, PACK_TS, comment))
+        (tmp_path / "tree.xdfmeta").write_bytes(("\n".join(lines) + "\n").encode())
+    for path, comment in (uaem or {}).items():
+        line = "----rwed 2020-01-01 00:00:00.00 %s\n" % comment
+        (tree / (path + ".uaem")).write_bytes(line.encode())
+    return tree
+
+
+@pytest.mark.parametrize("meta", ["xdfmeta", "uaem", "xdfmeta_sub", "uaem_sub"])
+def fs_comment_too_long_pack_test(tmp_path, meta, capsys):
+    # A comment the image cannot hold, in the metadata of a tree to pack,
+    # stops xdftool pack before it creates the image.
+    path = "sub/b.txt" if meta.endswith("_sub") else "a.txt"
+    comments = {path: "x" * 80}
+    if meta.startswith("xdfmeta"):
+        tree = make_pack_tree(tmp_path, xdfmeta=comments)
+    else:
+        tree = make_pack_tree(tmp_path, uaem=comments)
+    image = tmp_path / "test.adf"
+    capsys.readouterr()
+    assert xdftool_main([str(image), "pack", str(tree)]) == 3
+    assert "Invalid comment" in capsys.readouterr().out
+    assert not image.exists()
+
+
+@pytest.mark.parametrize("meta", ["no_entry", "uaem_wins"])
+def fs_comment_pack_unused_meta_test(tmp_path, meta):
+    # Only comments that xdftool pack writes are checked: not one in the
+    # .xdfmeta file for a path that is not in the tree, nor one there for a
+    # file whose .uaem file pack takes instead.
+    if meta == "no_entry":
+        tree = make_pack_tree(tmp_path, xdfmeta={"gone.txt": "x" * 80})
+        want = ""
+    else:
+        tree = make_pack_tree(
+            tmp_path, xdfmeta={"a.txt": "x" * 80}, uaem={"a.txt": "short"}
+        )
+        want = "short"
+    image = tmp_path / "test.adf"
+    assert xdftool_main([str(image), "pack", str(tree)]) == 0
+    blkdev, volume = open_volume(image)
+    assert get_comment(volume, "a.txt") == FSString(want)
+    assert volume.read_file(FSString("sub/b.txt")) == b"data"
+    close_volume(blkdev, volume)
+
+
 @pytest.mark.parametrize("dos_type", DOS_TYPES, ids=dos_id)
 def fs_comment_not_latin1_test(tmp_path, dos_type):
     # The disk holds Latin-1 only. A comment it cannot encode is refused
