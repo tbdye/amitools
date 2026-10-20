@@ -172,8 +172,17 @@ class ADFSNode:
     def get_file_name(self):
         return self.name
 
-    def delete(self, wipe=False, all=False, update_ts=True):
+    def delete(self, wipe=False, all=False, update_ts=True, checked=False):
         if all:
+            # refuse before the first entry goes, not after: the tree is
+            # checked once, here, and not again for each entry
+            if not checked:
+                if self.parent:
+                    self.parent.check_delete(self, all, update_ts)
+                else:
+                    # the root: the tree of each entry
+                    for entry in self.get_entries():
+                        self.check_delete(entry, all, update_ts)
             self.delete_children(wipe, all, update_ts)
         self.parent._delete(self, wipe, update_ts)
 
@@ -205,6 +214,7 @@ class ADFSNode:
         # dircache: change a copy of the record, swapped in once written
         record = None
         if self.volume.is_dircache and self.parent:
+            self.parent.check_dircache()
             record = self.parent.get_dircache_record(self.name.get_name())
             if not record:
                 raise FSError(INTERNAL_ERROR, node=self, extra="dc not found!")
