@@ -3,6 +3,7 @@ import struct
 import pytest
 
 from amitools.fs.ADFSVolume import ADFSVolume
+from amitools.fs.FSError import FSError, INVALID_DIR_CACHE_BLOCK
 from amitools.fs.FSString import FSString
 from amitools.fs.blkdev.ADFBlockDevice import ADFBlockDevice
 from amitools.fs.block.Block import Block
@@ -11,6 +12,7 @@ from amitools.fs.block.DirCacheBlock import DirCacheBlock, DirCacheRecord
 from amitools.fs.validate.Log import Log
 from amitools.fs.validate.Validator import Validator
 import amitools.fs.DosType as DosType
+from amitools.tools.xdftool import main as xdftool_main
 
 DOS_TYPES = [DosType.DOS0 + n for n in range(8)]
 FFS_DOS_TYPES = [DosType.DOS1, DosType.DOS3, DosType.DOS5, DosType.DOS7]
@@ -181,17 +183,18 @@ def fs_validate_dircache_record_test(tmp_path, dos_type, change):
         assert words in error
 
 
+def overrun(dcb):
+    dcb.num_records = 0xFFFFFFFF
+    dcb.write()
+
+
 @pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
-def fs_validate_dircache_record_overrun_test(tmp_path, dos_type):
+def fs_validate_dircache_record_overrun_test(tmp_path, dos_type, capsys):
     # A record count that runs past the end of the block makes the block
-    # invalid; neither the validator nor reading the directory may crash.
+    # invalid. The validator reports it, and reading the directory raises
+    # an error, which xdftool reports.
     image = tmp_path / "test.adf"
     dcb_num = make_dircache_volume(image, dos_type)[-1]
-
-    def overrun(dcb):
-        dcb.num_records = 0xFFFFFFFF
-        dcb.write()
-
     rewrite_dircache_block(image, dcb_num, overrun)
     errors = validate(image)
     assert len(errors) == 1
@@ -203,9 +206,41 @@ def fs_validate_dircache_record_overrun_test(tmp_path, dos_type):
     volume = ADFSVolume(blkdev)
     volume.open()
     node = volume.get_path_name(FSString("dir"))
-    node.read()
-    assert not node.valid
+    with pytest.raises(FSError) as error:
+        node.read()
+    assert error.value.code == INVALID_DIR_CACHE_BLOCK
     close_volume(blkdev, volume)
+
+    capsys.readouterr()
+    assert xdftool_main([str(image), "list"]) == 3
+    assert "Invalid DirCache Block" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("op", ["write", "delete"])
+@pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
+def fs_validate_dircache_overrun_change_test(tmp_path, dos_type, op):
+    # Nothing changes a directory whose dircache cannot be read: a write
+    # would drop the records it could not read, and leave the block
+    # allocated with nothing pointing to it. Trying again fails again.
+    image = tmp_path / "test.adf"
+    dcb_num = make_dircache_volume(image, dos_type)[-1]
+    rewrite_dircache_block(image, dcb_num, overrun)
+    before = image.read_bytes()
+    blkdev = ADFBlockDevice(str(image))
+    blkdev.open()
+    volume = ADFSVolume(blkdev)
+    volume.open()
+    free = volume.get_free_blocks()
+    for attempt in range(2):
+        with pytest.raises(FSError) as error:
+            if op == "write":
+                volume.write_file(b"x", FSString("dir/new"))
+            else:
+                volume.delete(FSString("dir/file00"))
+        assert error.value.code == INVALID_DIR_CACHE_BLOCK
+    assert volume.get_free_blocks() == free
+    close_volume(blkdev, volume)
+    assert image.read_bytes() == before
 
 
 def dircache_like_data(blkdev):

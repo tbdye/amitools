@@ -112,8 +112,11 @@ class ADFSDir(ADFSNode):
                 dcb = DirCacheBlock(self.blkdev, dcb_num)
                 dcb.read()
                 if not dcb.valid:
-                    self.valid = False
-                    return
+                    # nothing may change a directory whose dircache it cannot
+                    # read: it would drop the records it could not read
+                    self.entries = None
+                    self.dcache_blks = None
+                    raise FSError(INVALID_DIR_CACHE_BLOCK, block=dcb, node=self)
                 self.dcache_blks.append(dcb)
                 dcb_num = dcb.next_cache
 

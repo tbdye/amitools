@@ -21,6 +21,7 @@ INVALID_PARENT_DIRECTORY = 20
 FILE_NOT_FOUND = 21
 INVALID_VOLUME_NAME = 22
 INVALID_COMMENT = 23
+INVALID_DIR_CACHE_BLOCK = 24
 
 error_names = {
     INVALID_BOOT_BLOCK: "Invalid Boot Block",
@@ -46,6 +47,7 @@ error_names = {
     FILE_NOT_FOUND: "File not found",
     INVALID_VOLUME_NAME: "Invalid volume name",
     INVALID_COMMENT: "Invalid comment",
+    INVALID_DIR_CACHE_BLOCK: "Invalid DirCache Block",
 }
 
 
