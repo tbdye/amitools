@@ -169,6 +169,9 @@ class ADFSDir(ADFSNode):
 
     def _create_node(self, node, name, meta_info, update_ts=True):
         self.ensure_entries()
+        # my header is written back with a pointer only to a comment block
+        # that is still mine
+        self._check_comment_block()
 
         # make sure a default meta_info is available
         if meta_info == None:
@@ -234,6 +237,7 @@ class ADFSDir(ADFSNode):
                 # nothing links the new node yet: release all of its blocks
                 self.volume.bitmap.dealloc_n(free_blks + [comment_blk_num])
                 raise
+            node.comment_blk_num = comment_blk_num
             node.meta_info.set_comment(extra_comment)
 
         # dircache: create record for this node
@@ -319,6 +323,9 @@ class ADFSDir(ADFSNode):
             next_blk = 0
         else:
             next_blk = names[pos + 1].block.blk_num
+        # the header that unlinks the node, mine or that of the entry in
+        # front of it, keeps a pointer only to a comment block still its own
+        (self if prev == None else prev)._check_comment_block()
 
         # remove node from the hash chain
         if prev == None:
@@ -410,8 +417,8 @@ class ADFSDir(ADFSNode):
     def draw_on_bitmap(self, bm, show_all=False, first=True):
         blk_num = self.block.blk_num
         bm[blk_num] = ord("D")
-        if self.block.comment_block_id != 0:
-            bm[self.block.comment_block_id] = ord("c")
+        if self._check_comment_block() != 0:
+            bm[self.comment_blk_num] = ord("c")
         if show_all or first:
             self.ensure_entries()
             for e in self.entries:
@@ -423,8 +430,9 @@ class ADFSDir(ADFSNode):
     def get_block_nums(self):
         self.ensure_entries()
         result = [self.block.blk_num]
-        if self.block.comment_block_id != 0:
-            result.append(self.block.comment_block_id)
+        # the root block has no comment block: comment_blk_num stays 0
+        if self._check_comment_block() != 0:
+            result.append(self.comment_blk_num)
         if self.volume.is_dircache:
             for dcb in self.dcache_blks:
                 result.append(dcb.blk_num)
@@ -433,9 +441,7 @@ class ADFSDir(ADFSNode):
     def get_blocks(self, with_data=False):
         self.ensure_entries()
         result = [self.block]
-        # the root block has no comment block
-        if getattr(self.block, "comment_block_id", 0) != 0:
-            result.append(self._read_comment_block())
+        result += self._get_comment_blocks()
         if self.volume.is_dircache:
             result += self.dcache_blks
         return result
@@ -605,8 +611,7 @@ class ADFSDir(ADFSNode):
     def get_block_usage(self, all=False, first=True):
         num_non_data = 1
         num_data = 0
-        # the root block has no comment block
-        if getattr(self.block, "comment_block_id", 0) != 0:
+        if self._check_comment_block() != 0:
             num_non_data += 1
         if self.dcache_blks != None:
             num_non_data += len(self.dcache_blks)
