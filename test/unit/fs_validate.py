@@ -264,3 +264,22 @@ def fs_validate_comment_block_own_key_test(tmp_path, dos_type):
     assert len(errors) == 1
     assert "@%06d:ERROR" % cblk_num in errors[0]
     assert "own key" in errors[0]
+
+
+def fs_validate_read_error_test(tmp_path, monkeypatch):
+    # A block that cannot be read is reported; the validator goes on.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, DosType.DOS0)
+    volume.write_file(b"data", FSString("file"))
+    blk_num = volume.get_path_name(FSString("file")).block.blk_num
+    close_volume(blkdev, volume)
+    read_block = ADFBlockDevice.read_block
+
+    def failing_read_block(self, num):
+        if num == blk_num:
+            raise IOError("read failed")
+        return read_block(self, num)
+
+    monkeypatch.setattr(ADFBlockDevice, "read_block", failing_read_block)
+    errors = validate(image)
+    assert "@%06d:ERROR:Can't read block" % blk_num in errors
