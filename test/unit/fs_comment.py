@@ -802,6 +802,101 @@ def fs_create_dircache_disk_full_test(tmp_path, dos_type, where, kind):
     assert validate(image) == []
 
 
+def make_dir_without_dircache_block(volume):
+    """a DOS4/5 "dir" without a dircache block, as the validator accepts"""
+    volume.create_dir(FSString("dir"))
+    node = volume.get_path_name(FSString("dir"))
+    dcb_num = node.block.extension
+    node.block.extension = 0
+    node.block.write()
+    volume.bitmap.dealloc_n([dcb_num])
+    node.dcache_blks = []
+    return node
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+@pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
+def fs_create_no_dircache_block_write_fails_test(tmp_path, dos_type, kind, monkeypatch):
+    # The first entry of a directory without a dircache block brings the
+    # first one, which the directory links when it links the entry. Make
+    # each block write of that create fail in turn: the entry is either
+    # created, or not and all blocks taken for it are free again.
+    blkdev, volume = create_volume(tmp_path / "ref.adf", dos_type)
+    node = make_dir_without_dircache_block(volume)
+    with monkeypatch.context() as patch:
+        writes = fail_nth_write(patch, Block, 0)
+        create_entry(node, "new", kind, None)
+    close_volume(blkdev, volume)
+
+    for nth in range(1, len(writes) + 1):
+        image = tmp_path / ("test%d.adf" % nth)
+        blkdev, volume = create_volume(image, dos_type)
+        node = make_dir_without_dircache_block(volume)
+        free = volume.get_free_blocks()
+        with monkeypatch.context() as patch:
+            fail_nth_write(patch, Block, nth)
+            with pytest.raises(IOError):
+                create_entry(node, "new", kind, None)
+        created = volume.get_path_name(FSString("dir/new")) is not None
+        if not created:
+            assert volume.get_free_blocks() == free
+            assert node.block.extension == 0 and node.dcache_blks == []
+        volume.write_file(b"next", FSString("dir/next"))
+        close_volume(blkdev, volume)
+
+        blkdev, volume = open_volume(image)
+        assert (volume.get_path_name(FSString("dir/new")) is not None) == created
+        close_volume(blkdev, volume)
+        assert validate(image) == [], "write %d" % nth
+
+
+@pytest.mark.parametrize("kind", ["file", "dir"])
+@pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
+def fs_create_write_fails_twice_test(tmp_path, dos_type, kind, monkeypatch):
+    # If the parent's write fails and then the write that takes the new
+    # record out again, the record still points to the new header: its
+    # blocks stay allocated, and later entries do not take them.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    volume.create_dir(FSString("dir"))
+    parent = volume.get_path_name(FSString("dir"))
+    parent_num = parent.block.blk_num
+    dcb_num = parent.block.extension
+    free = volume.get_free_blocks()
+    write = Block.write
+    dcb_writes = []
+
+    def failing_write(self):
+        if self.blk_num == parent_num:
+            raise IOError("write failed")
+        if self.blk_num == dcb_num:
+            # the first adds the record, the second takes it out
+            dcb_writes.append(self)
+            if len(dcb_writes) == 2:
+                raise IOError("write failed")
+        write(self)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Block, "write", failing_write)
+        with pytest.raises(IOError):
+            create_entry(parent, "new", kind, None)
+    assert len(dcb_writes) == 2
+    (record,) = dircache_records(volume, "dir")
+    assert not volume.bitmap.get_bit(record.entry)
+    # the header and a data or dircache block
+    assert free - volume.get_free_blocks() == 2
+    volume.write_file(b"x" * 3000, FSString("other"))
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    assert volume.get_path_name(FSString("dir/new")) is None
+    assert not volume.bitmap.get_bit(record.entry)
+    blk = Block(blkdev, record.entry)
+    blk.read()
+    assert blk.valid and blk.sub_type == record.sub_type & 0xFFFFFFFF
+    close_volume(blkdev, volume)
+
+
 def same_hash_name(volume, name):
     """a name in the same hash chain as name"""
 

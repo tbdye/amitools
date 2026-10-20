@@ -242,9 +242,11 @@ class ADFSDir(ADFSNode):
             )
 
         # nothing links the node until my hash table is written: up to then,
-        # a failure releases all blocks taken for it
+        # a failure takes its dircache record out again and then releases
+        # all blocks taken for it
         old_hash_blk = self.block.hash_table[fn_hash]
-        has_dircache_record = False
+        old_extension = self.block.extension
+        record = None
         try:
             # now create the blocks for this node
             new_blk = node.blocks_create_new(
@@ -255,7 +257,7 @@ class ADFSDir(ADFSNode):
 
             # dircache: create record for this node
             if self.volume.is_dircache:
-                ok = self._dircache_add_entry(
+                record = self._dircache_add_entry(
                     name,
                     meta_info,
                     new_blk,
@@ -263,25 +265,31 @@ class ADFSDir(ADFSNode):
                     update_myself=False,
                     sub_type=Block.ST_USERDIR if node.is_dir() else Block.ST_FILE,
                 )
-                if not ok:
+                if record == None:
                     raise FSError(
                         NO_FREE_BLOCKS, node=self, file_name=name, extra="want dcache"
                     )
-                has_dircache_record = True
 
             # update my dir
             self.block.hash_table[fn_hash] = new_blk
             self.block.write()
         except Exception:
+            # my block on disk is as it was
             self.block.hash_table[fn_hash] = old_hash_blk
             blk_nums = free_blks[:]
             if node.comment_blk_num != 0:
                 blk_nums.append(node.comment_blk_num)
             if node.is_dir() and node.dcache_blks:
                 blk_nums += [dcb.blk_num for dcb in node.dcache_blks]
+            if self.block.extension != old_extension:
+                # the record's dircache block was my first, linked from my
+                # block in memory only
+                self.block.extension = old_extension
+                blk_nums.append(self.dcache_blks.pop().blk_num)
+            elif record != None and not self._dircache_take_back(record):
+                # the record still points to the node: keep its blocks
+                raise
             self.volume.bitmap.dealloc_n(blk_nums)
-            if has_dircache_record:
-                self._dircache_remove_entry(node)
             raise
 
         # add node
@@ -528,7 +536,9 @@ class ADFSDir(ADFSNode):
             name=name,
             comment=meta_info.get_comment(),
         )
-        return self._dircache_add_entry_int(r, update_myself)
+        if not self._dircache_add_entry_int(r, update_myself):
+            return None
+        return r
 
     def _dircache_add_entry_int(self, r, update_myself=True):
         r_bytes = r.get_size()
