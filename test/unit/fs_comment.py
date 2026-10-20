@@ -463,36 +463,154 @@ def fs_dircache_add_block_write_fails_test(tmp_path, dos_type, nth, monkeypatch)
     assert validate(image) == []
 
 
-@pytest.mark.parametrize("old_comment", ["", "o" * 79], ids=["new_block", "own_block"])
+def make_entry(volume, path, kind):
+    if kind == "file":
+        volume.write_file(b"data", FSString(path))
+    else:
+        volume.create_dir(FSString(path))
+    return volume.get_path_name(FSString(path))
+
+
+# comment changes: (old comment, new comment)
+LONGNAME_CHANGES = {
+    "grow": ("", "c" * 79),
+    "shrink": ("o" * 79, "short"),
+    "reuse": ("o" * 79, "c" * 79),
+    "remove": ("o" * 79, ""),
+}
+
+
+@pytest.mark.parametrize(
+    "op,fail",
+    [
+        ("grow", "comment"),
+        ("grow", "header"),
+        ("shrink", "header"),
+        ("reuse", "comment"),
+        ("reuse", "header"),
+        ("remove", "header"),
+    ],
+)
+@pytest.mark.parametrize("kind", ["file", "dir"])
 @pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
-def fs_comment_block_write_fails_test(tmp_path, dos_type, old_comment, monkeypatch):
-    # The header may point to a comment block only once that is written. A
-    # block allocated for the comment is released again when the write
-    # fails, while a comment block the entry already has stays its own.
+def fs_comment_block_write_fails_test(tmp_path, dos_type, kind, op, fail, monkeypatch):
+    # A comment change whose comment block or header cannot be written
+    # changes nothing, on disk or in memory: a block allocated for the
+    # comment is released, and a comment block the entry already has stays
+    # its own and keeps the old comment.
+    old, new = LONGNAME_CHANGES[op]
     image = tmp_path / "test.adf"
     name = "n" * 60
     blkdev, volume = create_volume(image, dos_type)
-    volume.write_file(b"data", FSString(name))
-    node = volume.get_path_name(FSString(name))
-    if old_comment:
-        node.change_comment(FSString(old_comment))
+    node = make_entry(volume, name, kind)
+    if old:
+        node.change_comment(FSString(old))
     blk_num = node.block.comment_block_id
     free = volume.get_free_blocks()
 
+    cls = CommentBlock if fail == "comment" else type(node.block)
     with monkeypatch.context() as patch:
-        patch.setattr(CommentBlock, "write", fail_write)
+        patch.setattr(cls, "write", fail_write)
         with pytest.raises(IOError):
-            node.change_comment(FSString("c" * 79))
+            node.change_comment(FSString(new))
     assert node.block.comment_block_id == blk_num
-    assert node.get_meta_info().get_comment() == FSString(old_comment)
+    assert node.get_meta_info().get_comment() == FSString(old)
     assert volume.get_free_blocks() == free
     node.change_protect(0x0F)
     close_volume(blkdev, volume)
 
     blkdev, volume = open_volume(image)
-    assert get_comment(volume, name) == FSString(old_comment)
+    assert get_comment(volume, name) == FSString(old)
+    # the next entry gets a block of its own
+    volume.write_file(b"next", FSString("next"))
     close_volume(blkdev, volume)
     assert validate(image) == []
+
+
+DIRCACHE_CHANGES = {
+    "grow": ("", "c" * 79),
+    "grow_in_place": ("", "a comment"),
+    "shrink": ("o" * 40, "short"),
+    "remove": ("o" * 40, ""),
+}
+
+
+@pytest.mark.parametrize("fail", ["header", "dircache"])
+@pytest.mark.parametrize("op", list(DIRCACHE_CHANGES))
+@pytest.mark.parametrize("kind", ["file", "dir"])
+@pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
+def fs_comment_dircache_write_fails_test(
+    tmp_path, dos_type, kind, op, fail, monkeypatch
+):
+    # A comment change whose header or dircache record cannot be written
+    # leaves both as they were, on disk and in memory. For "grow" the
+    # record has no room left in its block and needs a new one.
+    old, new = DIRCACHE_CHANGES[op]
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    volume.create_dir(FSString("dir"))
+    node = make_entry(volume, "dir/e", kind)
+    if old:
+        node.change_comment(FSString(old))
+    if op == "grow":
+        fill_dir(volume, 16)
+    parent = volume.get_path_name(FSString("dir"))
+    free = volume.get_free_blocks()
+
+    cls = DirCacheBlock if fail == "dircache" else type(node.block)
+    with monkeypatch.context() as patch:
+        patch.setattr(cls, "write", fail_write)
+        with pytest.raises(IOError):
+            node.change_comment(FSString(new))
+    assert volume.get_free_blocks() == free
+    assert node.get_meta_info().get_comment() == FSString(old)
+    assert parent.get_dircache_record(FSString("e")).comment == FSString(old)
+    node.change_protect(0x0F)
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    assert get_comment(volume, "dir/e") == FSString(old)
+    check_dircache(volume, "dir", {"e": old})
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+@pytest.mark.parametrize("nth", [1, 2], ids=["to_block", "from_block"])
+@pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
+def fs_comment_dircache_move_write_fails_test(tmp_path, dos_type, nth, monkeypatch):
+    # A record that grows out of its full block is written to the block
+    # with room before it leaves its own. If that first write fails,
+    # nothing changes. If the second fails, the record is in both blocks,
+    # on disk as in memory: the entry is still listed and can change.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    volume.create_dir(FSString("dir"))
+    fill_dir(volume, 18)
+    node = volume.get_path_name(FSString("dir/f00"))
+    free = volume.get_free_blocks()
+
+    with monkeypatch.context() as patch:
+        fail_nth_write(patch, DirCacheBlock, nth)
+        with pytest.raises(IOError):
+            node.change_comment(FSString("c" * 79))
+    assert volume.get_free_blocks() == free
+    records = dircache_records(volume, "dir")
+    assert [r.name for r in records].count(FSString("f00")) == nth
+    node.change_protect(0x0F)
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    assert get_comment(volume, "dir/f00") == FSString()
+    assert "f00" in entry_names(volume, "dir")
+    records = dircache_records(volume, "dir")
+    assert [r.name for r in records].count(FSString("f00")) == nth
+    close_volume(blkdev, volume)
+    errors = validate(image)
+    if nth == 1:
+        assert errors == []
+    else:
+        assert len(errors) == 1
+        assert "duplicate dircache record 'f00'" in errors[0]
 
 
 @pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
