@@ -16,6 +16,7 @@ class ADFSDir(ADFSNode):
         ADFSNode.__init__(self, volume, parent)
         # state
         self.entries = None
+        self.entry_bad_blk = None
         self.dcache_blks = None
         self.dcache_bad_blk = None
         self.name_hash = None
@@ -78,8 +79,10 @@ class ADFSDir(ADFSNode):
             self.name_hash.append([])
 
     def read(self, recursive=False):
-        self._init_name_hash()
-        self.entries = []
+        # read into locals: a read that raises leaves me as I was
+        name_hash = [[] for i in range(self.block.hash_size)]
+        entries = []
+        entry_bad_blk = None
 
         # create initial list with blk_num/hash_index for dir scan
         blocks = []
@@ -93,46 +96,65 @@ class ADFSDir(ADFSNode):
             blk = Block(self.blkdev, blk_num)
             blk.read()
             if not blk.valid:
-                self.valid = False
-                return
+                # the entries read so far can still be listed and read, but
+                # a new entry could take the name or hash chain of one not
+                # read, and deleting me would lose those
+                entry_bad_blk = blk
+                break
             # create file/dir node
             hash_chain, node = self._read_add_node(blk, recursive)
             # store node in entries
-            self.entries.append(node)
+            entries.append(node)
             # store node in name_hash
-            self.name_hash[hash_idx].append(node)
+            name_hash[hash_idx].append(node)
             # follow hash chain
             if hash_chain != 0:
                 blocks.append((hash_chain, hash_idx))
 
         # dircaches available?
+        dcache_blks = None
+        dcache_bad_blk = None
         if self.volume.is_dircache:
-            self.dcache_blks = []
-            self.dcache_bad_blk = None
+            dcache_blks = []
             dcb_num = self.block.extension
             while dcb_num != 0:
                 dcb = DirCacheBlock(self.blkdev, dcb_num)
-                if not self._read_dircache_block(dcb):
+                if not self._read_dircache_block(dcb, dcache_blks):
                     # the entries can still be read, but a change would drop
                     # the records that could not be read
-                    self.dcache_bad_blk = dcb
+                    dcache_bad_blk = dcb
                     break
-                self.dcache_blks.append(dcb)
+                dcache_blks.append(dcb)
                 dcb_num = dcb.next_cache
 
-    def _read_dircache_block(self, dcb):
-        """read the next block of my dircache chain. It must lie on the
-        disk, not be in the chain already, and be a valid dircache block
-        of mine"""
+        self.hash_size = self.block.hash_size
+        self.name_hash = name_hash
+        self.entries = entries
+        self.entry_bad_blk = entry_bad_blk
+        self.dcache_blks = dcache_blks
+        self.dcache_bad_blk = dcache_bad_blk
+        if entry_bad_blk != None:
+            self.valid = False
+
+    def _read_dircache_block(self, dcb, dcache_blks):
+        """read the next block of my dircache chain, after dcache_blks. It
+        must lie on the disk, not be in the chain already, and be a valid
+        dircache block of mine"""
         blk_num = dcb.blk_num
         if blk_num < self.blkdev.reserved or blk_num >= self.blkdev.num_blocks:
             return False
-        if blk_num in [b.blk_num for b in self.dcache_blks]:
+        if blk_num in [b.blk_num for b in dcache_blks]:
             return False
         dcb.read()
         if not dcb.valid:
             return False
         return dcb.own_key == blk_num and dcb.parent == self.block.blk_num
+
+    def check_entries(self):
+        """refuse to add an entry to a directory, or remove one, if not all
+        its entries could be read"""
+        if self.entry_bad_blk != None:
+            raise FSError(INVALID_ENTRY_BLOCK, block=self.entry_bad_blk, node=self)
 
     def check_dircache(self):
         """refuse to change a directory whose dircache cannot be read"""
@@ -191,6 +213,7 @@ class ADFSDir(ADFSNode):
 
     def _create_node(self, node, name, meta_info, update_ts=True):
         self.ensure_entries()
+        self.check_entries()
         self.check_dircache()
         if update_ts and self.parent:
             self.parent.check_dircache()
@@ -323,11 +346,13 @@ class ADFSDir(ADFSNode):
 
     def _delete(self, node, wipe, update_ts):
         self.ensure_entries()
+        self.check_entries()
         self.check_dircache()
         if update_ts and self.parent:
             self.parent.check_dircache()
         if node.is_dir():
             node.ensure_entries()
+            node.check_entries()
             node.check_dircache()
 
         # can we delete?
@@ -517,6 +542,12 @@ class ADFSDir(ADFSNode):
 
     # ----- dir cache -----
 
+    def _dircache_check_read(self):
+        """the changes refuse a dircache that could not be read before they
+        write anything: getting here with one is a bug"""
+        if self.dcache_blks == None or self.dcache_bad_blk != None:
+            raise FSError(INTERNAL_ERROR, node=self, extra="dircache not read")
+
     def _dircache_add_entry(
         self, name, meta_info, entry_blk, size, update_myself=True, sub_type=0
     ):
@@ -541,6 +572,7 @@ class ADFSDir(ADFSNode):
         return r
 
     def _dircache_add_entry_int(self, r, update_myself=True):
+        self._dircache_check_read()
         r_bytes = r.get_size()
         # find a dircache block with enough space
         for dcb in self.dcache_blks:
@@ -609,6 +641,7 @@ class ADFSDir(ADFSNode):
         return freed
 
     def _dircache_remove_record(self, dcb, record, update_myself=True):
+        self._dircache_check_read()
         pos = self.dcache_blks.index(dcb)
         idx = dcb.records.index(record)
         # remove entry from this block
@@ -683,8 +716,7 @@ class ADFSDir(ADFSNode):
         new_record is written to another block before record leaves its
         own, and taken out again if that fails: only if that fails, too,
         are both on disk, and the records here as on disk"""
-        if self.dcache_blks == None:
-            return
+        self._dircache_check_read()
         # drop a copy of the record that a failed write left behind
         for dcb, other in self._dircache_records(record.entry):
             if other is not record:
