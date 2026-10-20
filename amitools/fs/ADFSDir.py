@@ -17,6 +17,7 @@ class ADFSDir(ADFSNode):
         # state
         self.entries = None
         self.dcache_blks = None
+        self.dcache_bad_blk = None
         self.name_hash = None
         self.hash_size = 72
         self.valid = False
@@ -107,18 +108,23 @@ class ADFSDir(ADFSNode):
         # dircaches available?
         if self.volume.is_dircache:
             self.dcache_blks = []
+            self.dcache_bad_blk = None
             dcb_num = self.block.extension
             while dcb_num != 0:
                 dcb = DirCacheBlock(self.blkdev, dcb_num)
                 dcb.read()
                 if not dcb.valid:
-                    # nothing may change a directory whose dircache it cannot
-                    # read: it would drop the records it could not read
-                    self.entries = None
-                    self.dcache_blks = None
-                    raise FSError(INVALID_DIR_CACHE_BLOCK, block=dcb, node=self)
+                    # the entries can still be read, but a change would drop
+                    # the records that could not be read
+                    self.dcache_bad_blk = dcb
+                    break
                 self.dcache_blks.append(dcb)
                 dcb_num = dcb.next_cache
+
+    def check_dircache(self):
+        """refuse to change a directory whose dircache cannot be read"""
+        if self.dcache_bad_blk != None:
+            raise FSError(INVALID_DIR_CACHE_BLOCK, block=self.dcache_bad_blk, node=self)
 
     def flush(self):
         if self.entries:
@@ -172,6 +178,9 @@ class ADFSDir(ADFSNode):
 
     def _create_node(self, node, name, meta_info, update_ts=True):
         self.ensure_entries()
+        self.check_dircache()
+        if update_ts and self.parent:
+            self.parent.check_dircache()
 
         # make sure a default meta_info is available
         if meta_info == None:
@@ -293,6 +302,12 @@ class ADFSDir(ADFSNode):
 
     def _delete(self, node, wipe, update_ts):
         self.ensure_entries()
+        self.check_dircache()
+        if update_ts and self.parent:
+            self.parent.check_dircache()
+        if node.is_dir():
+            node.ensure_entries()
+            node.check_dircache()
 
         # can we delete?
         if not node.can_delete():

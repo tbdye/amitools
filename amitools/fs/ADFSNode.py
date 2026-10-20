@@ -119,6 +119,7 @@ class ADFSNode:
         # dircache: change a copy of the record, swapped in once written
         record = None
         if self.volume.is_dircache and self.parent:
+            self.parent.check_dircache()
             record = self.parent.get_dircache_record(self.name.get_name())
             if not record:
                 raise FSError(INTERNAL_ERROR, node=self, extra="dc not found!")

@@ -191,8 +191,8 @@ def overrun(dcb):
 @pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
 def fs_validate_dircache_record_overrun_test(tmp_path, dos_type, capsys):
     # A record count that runs past the end of the block makes the block
-    # invalid. The validator reports it, and reading the directory raises
-    # an error, which xdftool reports.
+    # invalid. The validator reports it; the directory can still be listed
+    # and its files read, to rescue them.
     image = tmp_path / "test.adf"
     dcb_num = make_dircache_volume(image, dos_type)[-1]
     rewrite_dircache_block(image, dcb_num, overrun)
@@ -206,17 +206,18 @@ def fs_validate_dircache_record_overrun_test(tmp_path, dos_type, capsys):
     volume = ADFSVolume(blkdev)
     volume.open()
     node = volume.get_path_name(FSString("dir"))
-    with pytest.raises(FSError) as error:
-        node.read()
-    assert error.value.code == INVALID_DIR_CACHE_BLOCK
+    assert len(node.get_entries()) == 41
+    assert volume.read_file(FSString("dir/file01")) == b"x" * 50
     close_volume(blkdev, volume)
 
     capsys.readouterr()
-    assert xdftool_main([str(image), "list"]) == 3
-    assert "Invalid DirCache Block" in capsys.readouterr().out
+    assert xdftool_main([str(image), "list"]) == 0
+    assert "file39" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("op", ["write", "delete"])
+@pytest.mark.parametrize(
+    "op", ["write", "delete", "protect", "write_sub", "delete_dir"]
+)
 @pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
 def fs_validate_dircache_overrun_change_test(tmp_path, dos_type, op):
     # Nothing changes a directory whose dircache cannot be read: a write
@@ -235,10 +236,79 @@ def fs_validate_dircache_overrun_change_test(tmp_path, dos_type, op):
         with pytest.raises(FSError) as error:
             if op == "write":
                 volume.write_file(b"x", FSString("dir/new"))
-            else:
+            elif op == "delete":
                 volume.delete(FSString("dir/file00"))
+            elif op == "protect":
+                volume.get_path_name(FSString("dir/file00")).change_protect(0x0F)
+            elif op == "write_sub":
+                # its new time stamp would change the record of dir/sub
+                volume.write_file(b"x", FSString("dir/sub/new"))
+            else:
+                volume.delete(FSString("dir"), all=True)
         assert error.value.code == INVALID_DIR_CACHE_BLOCK
     assert volume.get_free_blocks() == free
+    close_volume(blkdev, volume)
+    assert image.read_bytes() == before
+
+
+def open_volume(path):
+    blkdev = ADFBlockDevice(str(path))
+    blkdev.open()
+    volume = ADFSVolume(blkdev)
+    volume.open()
+    return blkdev, volume
+
+
+@pytest.mark.parametrize("op", ["write", "delete", "protect"])
+@pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
+def fs_validate_root_dircache_overrun_test(tmp_path, dos_type, op, capsys):
+    # A volume whose root has an invalid dircache block opens, and its
+    # files list and read; a change to the root is refused.
+    image = tmp_path / "test.adf"
+    make_dircache_volume(image, dos_type)
+    blkdev, volume = open_volume(image)
+    dcb_num = volume.get_root_dir().block.extension
+    close_volume(blkdev, volume)
+    rewrite_dircache_block(image, dcb_num, overrun)
+    before = image.read_bytes()
+
+    blkdev, volume = open_volume(image)
+    names = [e.name.get_unicode_name() for e in volume.get_root_dir().get_entries()]
+    assert sorted(names) == ["dir", "top"]
+    assert volume.read_file(FSString("top")) == b"data"
+    with pytest.raises(FSError) as error:
+        if op == "write":
+            volume.write_file(b"x", FSString("new"))
+        elif op == "delete":
+            volume.delete(FSString("top"))
+        else:
+            volume.get_path_name(FSString("top")).change_protect(0x0F)
+    assert error.value.code == INVALID_DIR_CACHE_BLOCK
+    close_volume(blkdev, volume)
+    assert image.read_bytes() == before
+
+    capsys.readouterr()
+    assert xdftool_main([str(image), "list"]) == 0
+    out = capsys.readouterr().out
+    assert "top" in out and "file39" in out
+
+
+@pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
+def fs_validate_dircache_overrun_delete_dir_test(tmp_path, dos_type):
+    # An empty directory whose dircache block is invalid is not deleted:
+    # the dircache blocks after it could not be found and released.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    volume.create_dir(FSString("empty"))
+    dcb_num = volume.get_path_name(FSString("empty")).block.extension
+    close_volume(blkdev, volume)
+    rewrite_dircache_block(image, dcb_num, overrun)
+    before = image.read_bytes()
+
+    blkdev, volume = open_volume(image)
+    with pytest.raises(FSError) as error:
+        volume.delete(FSString("empty"))
+    assert error.value.code == INVALID_DIR_CACHE_BLOCK
     close_volume(blkdev, volume)
     assert image.read_bytes() == before
 
