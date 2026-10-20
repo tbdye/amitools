@@ -1,3 +1,4 @@
+from .block.Block import Block
 from .block.CommentBlock import CommentBlock
 from .block.EntryBlock import EntryBlock
 from .FileName import FileName
@@ -22,6 +23,8 @@ class ADFSNode:
         self.name = None
         self.valid = False
         self.meta_info = None
+        # the comment block that belongs to this entry, if any
+        self.comment_blk_num = 0
 
     def __str__(self):
         return "%s:'%s'(@%d)" % (
@@ -42,14 +45,34 @@ class ADFSNode:
 
     def create_meta_info(self):
         comment = self.block.comment
+        # a comment block that is not ours is never freed or rewritten. The
+        # header keeps pointing to our comment block if only its checksum
+        # is bad, so that the repaired block holds the comment again. Any
+        # other pointer is dropped with the next header write: that block
+        # is, or may become, another entry's
+        self.comment_blk_num = 0
         if self.block.comment_block_id != 0:
             comment_block = self._read_comment_block()
             if comment_block:
                 comment = comment_block.comment
-            else:
-                # never free or rewrite a block that is not ours
+                self.comment_blk_num = comment_block.blk_num
+            elif not self._is_damaged_comment_block():
                 self.block.comment_block_id = 0
         self.meta_info = MetaInfo(self.block.protect, self.block.mod_ts, comment)
+
+    def _is_damaged_comment_block(self):
+        """is the block the header points to our comment block, apart from
+        its checksum or comment?"""
+        blk_num = self.block.comment_block_id
+        if blk_num < self.blkdev.reserved or blk_num >= self.blkdev.num_blocks:
+            return False
+        block = Block(self.blkdev, blk_num)
+        block.read()
+        return (
+            block.type == Block.T_COMMENT
+            and block._get_long(1) == blk_num
+            and block._get_long(2) == self.block.blk_num
+        )
 
     def _read_comment_block(self):
         """return the comment block the header points to, or None unless it
@@ -130,7 +153,7 @@ class ADFSNode:
             and self.volume.is_longname
             and EntryBlock.needs_extra_comment_block(self.name.get_name(), comment)
         ):
-            comment_blk_num = self.block.comment_block_id
+            comment_blk_num = self.comment_blk_num
             new_blk = comment_blk_num == 0
             if new_blk:
                 blks = self.volume.bitmap.alloc_n(1)
@@ -169,9 +192,11 @@ class ADFSNode:
                 self.block.comment_block_id = comment_blk_num
             else:
                 self.block.comment = comment
-                if self.block.comment_block_id != 0:
-                    self.volume.bitmap.dealloc_n([self.block.comment_block_id])
-                    self.block.comment_block_id = 0
+                self.block.comment_block_id = 0
+                if self.comment_blk_num != 0:
+                    self.volume.bitmap.dealloc_n([self.comment_blk_num])
+                comment_blk_num = 0
+            self.comment_blk_num = comment_blk_num
 
             self.meta_info.set_comment(comment)
             dirty = True

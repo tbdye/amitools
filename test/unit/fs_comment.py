@@ -369,6 +369,20 @@ def fs_comment_longname_block_usage_test(tmp_path, dos_type):
     close_volume(blkdev, volume)
 
 
+@pytest.mark.parametrize("dos_type", DOS_TYPES, ids=dos_id)
+def fs_root_dir_block_nums_test(tmp_path, dos_type):
+    # The root block has no comment block. The root directory lists its own
+    # block and, on DOS4/5, its dircache block.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    root = volume.get_root_dir()
+    want = [880, 866] if dos_type in DIRCACHE_DOS_TYPES else [880]
+    assert root.get_block_nums() == want
+    assert [b.blk_num for b in root.get_blocks()] == want
+    assert root.get_block_usage() == (0, len(want))
+    close_volume(blkdev, volume)
+
+
 @pytest.mark.parametrize("keep", [2, 3], ids=["no_room", "room"])
 @pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
 def fs_comment_longname_create_disk_full_test(tmp_path, dos_type, keep):
@@ -513,6 +527,16 @@ KEEPER = "k" * 60
 VICTIM = "v" * 60
 
 
+FOREIGN_POINTERS = [
+    "other_entry",
+    "file_header",
+    "bad_checksum",
+    "out_of_range",
+    "free_block",
+    "data_block",
+]
+
+
 def make_foreign_comment_pointer(image, dos_type, kind):
     """a long name volume whose VICTIM points to a comment block that is
     not its own; returns the block number it points to"""
@@ -529,7 +553,11 @@ def make_foreign_comment_pointer(image, dos_type, kind):
         "file_header": keeper.block.blk_num,
         "bad_checksum": victim.block.comment_block_id,
         "out_of_range": blkdev.num_blocks + 1,
+        "free_block": blkdev.num_blocks - 1,
+        "data_block": keeper.data_blk_nums[0],
     }[kind]
+    if kind == "free_block":
+        assert volume.bitmap.get_bit(target)
     victim_num = victim.block.blk_num
     close_volume(blkdev, volume)
 
@@ -540,6 +568,9 @@ def make_foreign_comment_pointer(image, dos_type, kind):
         data[30] ^= 0xFF
         blkdev.write_block(target, data)
     else:
+        if kind == "free_block":
+            # data left over in a free block, not a valid block
+            blkdev.write_block(target, b"\xa5" * blkdev.block_bytes)
         hdr = FileHeaderBlock(blkdev, victim_num, is_longname=True)
         hdr.read()
         hdr.comment_block_id = target
@@ -549,9 +580,7 @@ def make_foreign_comment_pointer(image, dos_type, kind):
 
 
 @pytest.mark.parametrize("op", ["delete", "shrink", "grow"])
-@pytest.mark.parametrize(
-    "kind", ["other_entry", "file_header", "bad_checksum", "out_of_range"]
-)
+@pytest.mark.parametrize("kind", FOREIGN_POINTERS)
 @pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
 def fs_comment_block_not_owned_test(tmp_path, dos_type, kind, op):
     # An entry frees or rewrites only a comment block that is valid and names
@@ -587,6 +616,48 @@ def fs_comment_block_not_owned_test(tmp_path, dos_type, kind, op):
     close_volume(blkdev, volume)
     # a comment block with a bad checksum stays allocated: it may be anyone's
     if kind != "bad_checksum":
+        assert validate(image) == []
+
+
+@pytest.mark.parametrize("kind", FOREIGN_POINTERS)
+@pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
+def fs_comment_block_not_owned_kept_test(tmp_path, dos_type, kind):
+    # A change that leaves the comment alone writes the header back with
+    # its pointer to its own comment block: once its bad checksum is
+    # repaired, the comment is back. A pointer to any other block, used
+    # or free, is dropped: that block is, or may become, another entry's,
+    # as when the next file takes the blocks of KEEPER once it is deleted.
+    image = tmp_path / "test.adf"
+    target = make_foreign_comment_pointer(image, dos_type, kind)
+    blkdev, volume = open_volume(image)
+    free = volume.get_free_blocks()
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.get_block_nums() == [node.block.blk_num] + node.data_blk_nums
+    assert node.get_block_usage() == (1, 1)
+    node.change_protect(0x0F)
+    assert volume.get_free_blocks() == free
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    kept = kind == "bad_checksum"
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.block.comment_block_id == (target if kept else 0)
+    if not kept:
+        volume.delete(FSString(KEEPER))
+        volume.write_file(b"g" * 3000, FSString("g"))
+    close_volume(blkdev, volume)
+    if not kept:
+        assert validate(image) == []
+    if kind == "bad_checksum":
+        blkdev = ADFBlockDevice(str(image))
+        blkdev.open()
+        data = bytearray(blkdev.read_block(target))
+        data[30] ^= 0xFF
+        blkdev.write_block(target, data)
+        blkdev.close()
+        blkdev, volume = open_volume(image)
+        assert get_comment(volume, VICTIM) == FSString("v" * 79)
+        close_volume(blkdev, volume)
         assert validate(image) == []
 
 
