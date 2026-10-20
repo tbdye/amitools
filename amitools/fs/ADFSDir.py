@@ -685,10 +685,15 @@ class ADFSDir(ADFSNode):
         return blk_num  # return number of just deleted block
 
     def get_dircache_record(self, node):
-        """the dircache record of node, or None"""
-        records = self._dircache_records(node.block.blk_num)
+        """the dircache record of node, or None. Of the records for its
+        block, the one with its name: a stale record that an older tool left
+        for a deleted entry may name the block that node took"""
+        records = [r for dcb, r in self._dircache_records(node.block.blk_num)]
+        for record in records:
+            if record.name == node.name.get_name():
+                return record
         if records:
-            return records[0][1]
+            return records[0]
         return None
 
     def _dircache_fits(self, dcb, new_record, record):
@@ -715,12 +720,19 @@ class ADFSDir(ADFSNode):
         """replace record by new_record, in its block if it fits there. Else
         new_record is written to another block before record leaves its
         own, and taken out again if that fails: only if that fails, too,
-        are both on disk, and the records here as on disk"""
+        are both on disk, and the records here as on disk. With record
+        None, new_record is added"""
         self._dircache_check_read()
-        # drop a copy of the record that a failed write left behind
-        for dcb, other in self._dircache_records(record.entry):
+        # drop any other record of the entry: a copy that a failed write
+        # left behind, or a stale one
+        for dcb, other in self._dircache_records(new_record.entry):
             if other is not record:
                 self._dircache_remove_record(dcb, other)
+        if record is None:
+            # a failed write lost the record
+            if not self._dircache_add_entry_int(new_record):
+                raise FSError(INTERNAL_ERROR, node=self, extra="dc record lost!")
+            return
         for dcb in self.dcache_blks:
             if dcb.has_record(record):
                 break
