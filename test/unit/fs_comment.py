@@ -6,7 +6,7 @@ from amitools.fs.FSString import FSString
 from amitools.fs.MetaInfo import MetaInfo
 from amitools.fs.blkdev.ADFBlockDevice import ADFBlockDevice
 from amitools.fs.block.CommentBlock import CommentBlock
-from amitools.fs.block.DirCacheBlock import DirCacheBlock
+from amitools.fs.block.DirCacheBlock import DirCacheBlock, DirCacheRecord
 from amitools.fs.block.FileDataBlock import FileDataBlock
 from amitools.fs.block.FileHeaderBlock import FileHeaderBlock
 from amitools.fs.block.RootBlock import RootBlock
@@ -570,7 +570,7 @@ def fs_comment_dircache_write_fails_test(
             node.change_comment(FSString(new))
     assert volume.get_free_blocks() == free
     assert node.get_meta_info().get_comment() == FSString(old)
-    assert parent.get_dircache_record(FSString("e")).comment == FSString(old)
+    assert parent.get_dircache_record(node).comment == FSString(old)
     node.change_protect(0x0F)
     close_volume(blkdev, volume)
 
@@ -610,6 +610,50 @@ def fs_comment_dircache_move_write_fails_test(tmp_path, dos_type, nth, monkeypat
     assert "f00" in entry_names(volume, "dir")
     records = dircache_records(volume, "dir")
     assert [r.name for r in records].count(FSString("f00")) == 1
+    close_volume(blkdev, volume)
+    assert validate(image) == []
+
+
+@pytest.mark.parametrize("op", ["protect", "delete"])
+@pytest.mark.parametrize("where", ["before", "after"])
+@pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
+def fs_dircache_duplicate_record_test(tmp_path, dos_type, where, op):
+    # Failed writes can leave a second record of an entry, before or after
+    # its own, with the values of a change that failed. The next change of
+    # the entry keeps one record, with the values of its header, and
+    # deleting the entry removes every record of it.
+    image = tmp_path / "test.adf"
+    blkdev, volume = create_volume(image, dos_type)
+    volume.create_dir(FSString("dir"))
+    # f00 to f16 fill the first dircache block, f17 is in the second
+    fill_dir(volume, 18)
+    volume.delete(FSString("dir/f01"))
+    parent = volume.get_path_name(FSString("dir"))
+    first, last = parent.dcache_blks
+    name, dcb = ("f17", first) if where == "before" else ("f00", last)
+    (r,) = [r for r in first.records + last.records if r.name == FSString(name)]
+    dcb.add_record(
+        DirCacheRecord(
+            r.entry, r.size, 0x0F, r.mod_ts, r.sub_type, r.name, FSString("failed")
+        )
+    )
+    dcb.write()
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    path = "dir/" + name
+    if op == "protect":
+        volume.get_path_name(FSString(path)).change_protect(0x03)
+    else:
+        volume.delete(FSString(path))
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    records = [r for r in dircache_records(volume, "dir") if r.name == FSString(name)]
+    if op == "protect":
+        assert [(r.protect, r.comment) for r in records] == [(0x03, FSString())]
+    else:
+        assert records == []
     close_volume(blkdev, volume)
     assert validate(image) == []
 

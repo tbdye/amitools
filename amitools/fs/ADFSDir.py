@@ -281,7 +281,7 @@ class ADFSDir(ADFSNode):
                 blk_nums += [dcb.blk_num for dcb in node.dcache_blks]
             self.volume.bitmap.dealloc_n(blk_nums)
             if has_dircache_record:
-                self._dircache_remove_entry(name)
+                self._dircache_remove_entry(node)
             raise
 
         # add node
@@ -372,18 +372,18 @@ class ADFSDir(ADFSNode):
 
         # dircache?
         if self.volume.is_dircache:
-            free_blk_num = self._dircache_remove_entry(node.name.name)
+            free_dcb_nums = self._dircache_remove_entry(node)
         else:
-            free_blk_num = None
+            free_dcb_nums = []
 
         # (optional) wipe blocks
         if wipe:
             clr_blk = b"\0" * self.blkdev.block_bytes
             for blk_num in blk_nums:
                 self.blkdev.write_block(blk_num, clr_blk)
-            # wipe a potentially free'ed dircache block, too
-            if free_blk_num != None:
-                self.blkdev.write_block(free_blk_num, clr_blk)
+            # wipe free'ed dircache blocks, too
+            for blk_num in free_dcb_nums:
+                self.blkdev.write_block(blk_num, clr_blk)
 
         # update time stamps
         if update_ts:
@@ -561,13 +561,28 @@ class ADFSDir(ADFSNode):
         self.dcache_blks.append(dcb)
         return dcb
 
-    def _dircache_remove_entry(self, name, update_myself=True):
-        # first find entry
-        for dcb in self.dcache_blks:
-            record = dcb.get_record_by_name(name)
-            if record != None:
-                return self._dircache_remove_record(dcb, record, update_myself)
-        raise FSError(INTERNAL_ERROR, node=self, extra="no dc record!")
+    def _dircache_records(self, entry_blk):
+        """the dircache records of the entry in block entry_blk, with their
+        dircache blocks: one, or more if a failed write left a copy"""
+        result = []
+        for dcb in self.dcache_blks or []:
+            for record in dcb.records:
+                if record.entry == entry_blk:
+                    result.append((dcb, record))
+        return result
+
+    def _dircache_remove_entry(self, node, update_myself=True):
+        """remove all dircache records of node; returns the numbers of the
+        dircache blocks freed"""
+        records = self._dircache_records(node.block.blk_num)
+        if not records:
+            raise FSError(INTERNAL_ERROR, node=self, extra="no dc record!")
+        freed = []
+        for dcb, record in records:
+            blk_num = self._dircache_remove_record(dcb, record, update_myself)
+            if blk_num != None:
+                freed.append(blk_num)
+        return freed
 
     def _dircache_remove_record(self, dcb, record, update_myself=True):
         pos = self.dcache_blks.index(dcb)
@@ -612,12 +627,11 @@ class ADFSDir(ADFSNode):
         del self.dcache_blks[pos]
         return blk_num  # return number of just deleted block
 
-    def get_dircache_record(self, name):
-        if self.dcache_blks:
-            for dcb in self.dcache_blks:
-                record = dcb.get_record_by_name(name)
-                if record:
-                    return record
+    def get_dircache_record(self, node):
+        """the dircache record of node, or None"""
+        records = self._dircache_records(node.block.blk_num)
+        if records:
+            return records[0][1]
         return None
 
     def _dircache_fits(self, dcb, new_record, record):
@@ -647,6 +661,10 @@ class ADFSDir(ADFSNode):
         are both on disk, and the records here as on disk"""
         if self.dcache_blks == None:
             return
+        # drop a copy of the record that a failed write left behind
+        for dcb, other in self._dircache_records(record.entry):
+            if other is not record:
+                self._dircache_remove_record(dcb, other)
         for dcb in self.dcache_blks:
             if dcb.has_record(record):
                 break

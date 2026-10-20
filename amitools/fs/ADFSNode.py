@@ -120,16 +120,15 @@ class ADFSNode:
         record = None
         if self.volume.is_dircache and self.parent:
             self.parent.check_dircache()
-            record = self.parent.get_dircache_record(self.name.get_name())
+            record = self.parent.get_dircache_record(self)
             if not record:
                 raise FSError(INTERNAL_ERROR, node=self, extra="dc not found!")
+            # the new record takes the header's values: a copy of the record
+            # that a failed write left behind may hold those of that change
             new_record = copy.copy(record)
-            if protect:
-                new_record.protect = protect
-            if mod_ts:
-                new_record.mod_ts = mod_ts
-            if comment:
-                new_record.comment = comment
+            new_record.protect = protect or self.meta_info.get_protect()
+            new_record.mod_ts = mod_ts or self.meta_info.get_mod_ts()
+            new_record.comment = comment or self.meta_info.get_comment()
             # a grown record may need a new dircache block: make sure that
             # there is one before anything changes
             self.parent.check_dircache_room(record, new_record)
