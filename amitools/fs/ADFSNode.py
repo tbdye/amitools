@@ -22,6 +22,8 @@ class ADFSNode:
         self.name = None
         self.valid = False
         self.meta_info = None
+        # the comment block that belongs to this entry, if any
+        self.comment_blk_num = 0
 
     def __str__(self):
         return "%s:'%s'(@%d)" % (
@@ -46,6 +48,7 @@ class ADFSNode:
             comment_block = self._read_comment_block()
             if comment_block:
                 comment = comment_block.comment
+                self.comment_blk_num = comment_block.blk_num
             else:
                 # never free or rewrite a block that is not ours
                 self.block.comment_block_id = 0
@@ -172,6 +175,7 @@ class ADFSNode:
                 if self.block.comment_block_id != 0:
                     self.volume.bitmap.dealloc_n([self.block.comment_block_id])
                     self.block.comment_block_id = 0
+            self.comment_blk_num = self.block.comment_block_id
 
             self.meta_info.set_comment(comment)
             dirty = True
