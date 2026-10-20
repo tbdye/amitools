@@ -604,6 +604,41 @@ def fs_comment_block_not_owned_test(tmp_path, dos_type, kind, op):
         assert validate(image) == []
 
 
+@pytest.mark.parametrize(
+    "kind", ["other_entry", "file_header", "bad_checksum", "out_of_range"]
+)
+@pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
+def fs_comment_block_not_owned_kept_test(tmp_path, dos_type, kind):
+    # A change that leaves the comment alone writes the header back with
+    # the pointer it had, even to a comment block that the entry does not
+    # own: once its bad checksum is repaired, the comment is back.
+    image = tmp_path / "test.adf"
+    target = make_foreign_comment_pointer(image, dos_type, kind)
+    blkdev, volume = open_volume(image)
+    free = volume.get_free_blocks()
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.get_block_nums() == [node.block.blk_num] + node.data_blk_nums
+    assert node.get_block_usage() == (1, 1)
+    node.change_protect(0x0F)
+    assert volume.get_free_blocks() == free
+    close_volume(blkdev, volume)
+
+    blkdev, volume = open_volume(image)
+    assert volume.get_path_name(FSString(VICTIM)).block.comment_block_id == target
+    close_volume(blkdev, volume)
+    if kind == "bad_checksum":
+        blkdev = ADFBlockDevice(str(image))
+        blkdev.open()
+        data = bytearray(blkdev.read_block(target))
+        data[30] ^= 0xFF
+        blkdev.write_block(target, data)
+        blkdev.close()
+        blkdev, volume = open_volume(image)
+        assert get_comment(volume, VICTIM) == FSString("v" * 79)
+        close_volume(blkdev, volume)
+        assert validate(image) == []
+
+
 @pytest.mark.parametrize("length", [80, 256])
 @pytest.mark.parametrize("dos_type", DOS_TYPES, ids=dos_id)
 def fs_comment_too_long_test(tmp_path, dos_type, length):

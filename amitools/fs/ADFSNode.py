@@ -22,6 +22,8 @@ class ADFSNode:
         self.name = None
         self.valid = False
         self.meta_info = None
+        # the comment block that belongs to this entry, if any
+        self.comment_blk_num = 0
 
     def __str__(self):
         return "%s:'%s'(@%d)" % (
@@ -42,13 +44,14 @@ class ADFSNode:
 
     def create_meta_info(self):
         comment = self.block.comment
+        # a comment block that is not ours is never freed or rewritten, but
+        # the header keeps pointing to it until a new comment replaces it
+        self.comment_blk_num = 0
         if self.block.comment_block_id != 0:
             comment_block = self._read_comment_block()
             if comment_block:
                 comment = comment_block.comment
-            else:
-                # never free or rewrite a block that is not ours
-                self.block.comment_block_id = 0
+                self.comment_blk_num = comment_block.blk_num
         self.meta_info = MetaInfo(self.block.protect, self.block.mod_ts, comment)
 
     def _read_comment_block(self):
@@ -130,7 +133,7 @@ class ADFSNode:
             and self.volume.is_longname
             and EntryBlock.needs_extra_comment_block(self.name.get_name(), comment)
         ):
-            comment_blk_num = self.block.comment_block_id
+            comment_blk_num = self.comment_blk_num
             new_blk = comment_blk_num == 0
             if new_blk:
                 blks = self.volume.bitmap.alloc_n(1)
@@ -169,9 +172,11 @@ class ADFSNode:
                 self.block.comment_block_id = comment_blk_num
             else:
                 self.block.comment = comment
-                if self.block.comment_block_id != 0:
-                    self.volume.bitmap.dealloc_n([self.block.comment_block_id])
-                    self.block.comment_block_id = 0
+                self.block.comment_block_id = 0
+                if self.comment_blk_num != 0:
+                    self.volume.bitmap.dealloc_n([self.comment_blk_num])
+                comment_blk_num = 0
+            self.comment_blk_num = comment_blk_num
 
             self.meta_info.set_comment(comment)
             dirty = True
