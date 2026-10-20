@@ -1,5 +1,6 @@
 import copy
 
+from .block.Block import Block
 from .block.CommentBlock import CommentBlock
 from .block.EntryBlock import EntryBlock
 from .FileName import FileName
@@ -64,15 +65,29 @@ class ADFSNode:
 
     def create_meta_info(self):
         comment = self.block.comment
-        # a comment block that is not ours is never freed or rewritten, but
-        # the header keeps pointing to it until a new comment replaces it
+        # a comment block that is not ours is never freed or rewritten. The
+        # header keeps pointing to a block that cannot be read, so that a
+        # repaired comment block holds the comment again. A pointer to a
+        # valid block, or to a free one, is dropped with the next header
+        # write: that block is, or may become, another entry's
         self.comment_blk_num = 0
         if self.block.comment_block_id != 0:
             comment_block = self._read_comment_block()
             if comment_block:
                 comment = comment_block.comment
                 self.comment_blk_num = comment_block.blk_num
+            elif self._is_free_or_valid_block(self.block.comment_block_id):
+                self.block.comment_block_id = 0
         self.meta_info = MetaInfo(self.block.protect, self.block.mod_ts, comment)
+
+    def _is_free_or_valid_block(self, blk_num):
+        if blk_num < self.blkdev.reserved or blk_num >= self.blkdev.num_blocks:
+            return False
+        if self.volume.bitmap.get_bit(blk_num):
+            return True
+        block = Block(self.blkdev, blk_num)
+        block.read()
+        return block.valid
 
     def _read_comment_block(self):
         """return the comment block the header points to, or None unless it

@@ -975,6 +975,15 @@ KEEPER = "k" * 60
 VICTIM = "v" * 60
 
 
+FOREIGN_POINTERS = [
+    "other_entry",
+    "file_header",
+    "bad_checksum",
+    "out_of_range",
+    "free_block",
+]
+
+
 def make_foreign_comment_pointer(image, dos_type, kind):
     """a long name volume whose VICTIM points to a comment block that is
     not its own; returns the block number it points to"""
@@ -991,7 +1000,10 @@ def make_foreign_comment_pointer(image, dos_type, kind):
         "file_header": keeper.block.blk_num,
         "bad_checksum": victim.block.comment_block_id,
         "out_of_range": blkdev.num_blocks + 1,
+        "free_block": blkdev.num_blocks - 1,
     }[kind]
+    if kind == "free_block":
+        assert volume.bitmap.get_bit(target)
     victim_num = victim.block.blk_num
     close_volume(blkdev, volume)
 
@@ -1002,6 +1014,9 @@ def make_foreign_comment_pointer(image, dos_type, kind):
         data[30] ^= 0xFF
         blkdev.write_block(target, data)
     else:
+        if kind == "free_block":
+            # data left over in a free block, not a valid block
+            blkdev.write_block(target, b"\xa5" * blkdev.block_bytes)
         hdr = FileHeaderBlock(blkdev, victim_num, is_longname=True)
         hdr.read()
         hdr.comment_block_id = target
@@ -1011,9 +1026,7 @@ def make_foreign_comment_pointer(image, dos_type, kind):
 
 
 @pytest.mark.parametrize("op", ["delete", "shrink", "grow"])
-@pytest.mark.parametrize(
-    "kind", ["other_entry", "file_header", "bad_checksum", "out_of_range"]
-)
+@pytest.mark.parametrize("kind", FOREIGN_POINTERS)
 @pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
 def fs_comment_block_not_owned_test(tmp_path, dos_type, kind, op):
     # An entry frees or rewrites only a comment block that is valid and names
@@ -1052,14 +1065,14 @@ def fs_comment_block_not_owned_test(tmp_path, dos_type, kind, op):
         assert validate(image) == []
 
 
-@pytest.mark.parametrize(
-    "kind", ["other_entry", "file_header", "bad_checksum", "out_of_range"]
-)
+@pytest.mark.parametrize("kind", FOREIGN_POINTERS)
 @pytest.mark.parametrize("dos_type", LONGNAME_DOS_TYPES, ids=dos_id)
 def fs_comment_block_not_owned_kept_test(tmp_path, dos_type, kind):
     # A change that leaves the comment alone writes the header back with
-    # the pointer it had, even to a comment block that the entry does not
-    # own: once its bad checksum is repaired, the comment is back.
+    # its pointer to a block that cannot be read: once its bad checksum is
+    # repaired, the comment is back. A pointer to a valid block, or to a
+    # free one, is dropped: that block is, or may become, another entry's,
+    # as when the next file takes the blocks of KEEPER once it is deleted.
     image = tmp_path / "test.adf"
     target = make_foreign_comment_pointer(image, dos_type, kind)
     blkdev, volume = open_volume(image)
@@ -1072,8 +1085,15 @@ def fs_comment_block_not_owned_kept_test(tmp_path, dos_type, kind):
     close_volume(blkdev, volume)
 
     blkdev, volume = open_volume(image)
-    assert volume.get_path_name(FSString(VICTIM)).block.comment_block_id == target
+    kept = kind in ("bad_checksum", "out_of_range")
+    node = volume.get_path_name(FSString(VICTIM))
+    assert node.block.comment_block_id == (target if kept else 0)
+    if not kept:
+        volume.delete(FSString(KEEPER))
+        volume.write_file(b"g" * 3000, FSString("g"))
     close_volume(blkdev, volume)
+    if not kept:
+        assert validate(image) == []
     if kind == "bad_checksum":
         blkdev = ADFBlockDevice(str(image))
         blkdev.open()
