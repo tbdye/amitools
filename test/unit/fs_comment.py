@@ -438,12 +438,13 @@ def fail_nth_write(monkeypatch, cls, nth):
     monkeypatch.setattr(cls, "write", failing_write)
 
 
-@pytest.mark.parametrize("nth", [1, 2], ids=["block", "link"])
+@pytest.mark.parametrize("nth", [1, 2, 3], ids=["block", "link", "leave"])
 @pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
 def fs_dircache_add_block_write_fails_test(tmp_path, dos_type, nth, monkeypatch):
     # A grown record that leaves a full dircache block needs a new one. That
-    # is written before the last block links to it; if either write fails,
-    # the new block is released and nothing links to it.
+    # is written before the last block links to it, and the record leaves
+    # its old block last; if any of these writes fails, the new block is
+    # released and nothing links to it.
     image = tmp_path / "test.adf"
     blkdev, volume = create_volume(image, dos_type)
     volume.create_dir(FSString("dir"))
@@ -584,9 +585,9 @@ def fs_comment_dircache_write_fails_test(
 @pytest.mark.parametrize("dos_type", DIRCACHE_DOS_TYPES, ids=dos_id)
 def fs_comment_dircache_move_write_fails_test(tmp_path, dos_type, nth, monkeypatch):
     # A record that grows out of its full block is written to the block
-    # with room before it leaves its own. If that first write fails,
-    # nothing changes. If the second fails, the record is in both blocks,
-    # on disk as in memory: the entry is still listed and can change.
+    # with room before it leaves its own. If either write fails, nothing
+    # changes: a record already written to the block with room is taken
+    # out again.
     image = tmp_path / "test.adf"
     blkdev, volume = create_volume(image, dos_type)
     volume.create_dir(FSString("dir"))
@@ -600,7 +601,7 @@ def fs_comment_dircache_move_write_fails_test(tmp_path, dos_type, nth, monkeypat
             node.change_comment(FSString("c" * 79))
     assert volume.get_free_blocks() == free
     records = dircache_records(volume, "dir")
-    assert [r.name for r in records].count(FSString("f00")) == nth
+    assert [r.name for r in records].count(FSString("f00")) == 1
     node.change_protect(0x0F)
     close_volume(blkdev, volume)
 
@@ -608,14 +609,9 @@ def fs_comment_dircache_move_write_fails_test(tmp_path, dos_type, nth, monkeypat
     assert get_comment(volume, "dir/f00") == FSString()
     assert "f00" in entry_names(volume, "dir")
     records = dircache_records(volume, "dir")
-    assert [r.name for r in records].count(FSString("f00")) == nth
+    assert [r.name for r in records].count(FSString("f00")) == 1
     close_volume(blkdev, volume)
-    errors = validate(image)
-    if nth == 1:
-        assert errors == []
-    else:
-        assert len(errors) == 1
-        assert "duplicate dircache record 'f00'" in errors[0]
+    assert validate(image) == []
 
 
 FAILING_WRITES = {

@@ -615,8 +615,8 @@ class ADFSDir(ADFSNode):
     def update_dircache_record(self, record, new_record):
         """replace record by new_record, in its block if it fits there. Else
         new_record is written to another block before record leaves its
-        own: a write that fails leaves at worst both on disk, and the
-        records here as on disk"""
+        own, and taken out again if that fails: only if that fails, too,
+        are both on disk, and the records here as on disk"""
         if self.dcache_blks == None:
             return
         for dcb in self.dcache_blks:
@@ -636,7 +636,24 @@ class ADFSDir(ADFSNode):
             # check_dircache_room() made sure that this finds room
             if not self._dircache_add_entry_int(new_record):
                 raise FSError(INTERNAL_ERROR, node=self, extra="dc record lost!")
-            self._dircache_remove_record(dcb, record)
+            try:
+                self._dircache_remove_record(dcb, record)
+            except Exception:
+                self._dircache_take_back(new_record)
+                raise
+
+    def _dircache_take_back(self, record):
+        """remove a record added just before, and a block added for it,
+        after a later write failed. Returns False if that fails, too: the
+        record then stays, here as on disk"""
+        for dcb in self.dcache_blks:
+            if dcb.has_record(record):
+                try:
+                    self._dircache_remove_record(dcb, record)
+                except Exception:
+                    return False
+                break
+        return True
 
     def get_block_usage(self, all=False, first=True):
         num_non_data = 1
