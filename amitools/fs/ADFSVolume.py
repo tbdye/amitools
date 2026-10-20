@@ -49,12 +49,12 @@ class ADFSVolume:
                 self.meta_info = RootMetaInfo(
                     self.root.create_ts, self.root.disk_ts, self.root.mod_ts
                 )
-                # create bitmap: reading the entries looks up free blocks
-                self.bitmap = ADFSBitmap(self.root)
-                self.bitmap.read()
                 # create root dir
                 self.root_dir = ADFSVolDir(self, self.root)
                 self.root_dir.read()
+                # create bitmap
+                self.bitmap = ADFSBitmap(self.root)
+                self.bitmap.read()
                 self.valid = True
             else:
                 raise FSError(INVALID_ROOT_BLOCK, block=self.root)
